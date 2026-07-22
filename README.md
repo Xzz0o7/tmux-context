@@ -1,8 +1,8 @@
 # tmux-context
 
-`tmux-context` automatically names tmux sessions from the completed Codex task, shows a mouse-enabled sidebar for the current conversation, and keeps compatible terminal titles in sync.
+[中文文档](README.zh-CN.md)
 
-It is a standalone extraction from `cs-session-manager`: no session index, archive database, or `cs` command is required.
+`tmux-context` automatically names tmux sessions from the completed Codex task, shows a mouse-enabled sidebar for the current conversation, and keeps compatible terminal titles in sync.
 
 ## Preview
 
@@ -26,10 +26,10 @@ PowerShell compatibility means that you can install, launch, diagnose, and attac
 - Session titles prioritize the most recent meaningful task whose Codex response has completed.
 - Weak text such as `继续`, raw shell commands, and image placeholders does not rename a session.
 - The current-session sidebar supports mouse selection, collapsing one prompt at a time, expanding AI replies, scrolling, filtering, and hiding/showing reasoning output.
-- In expanded text, one click sets a selection start; drag to an endpoint, or click the endpoint again, to copy only the selected body text. Headers, timestamps, and separators are excluded.
+- Click a conversation once to expand or collapse it. Drag text in an expanded conversation to copy only the selected body text; headers, timestamps, and separators are excluded.
 - On WSL, selected text is copied through Windows PowerShell with UTF-8 input, preserving Chinese and other Unicode text.
 - Clipboard writes run in the background, so the selection highlight remains responsive while copying.
-- Dragging text in a normal tmux pane copies it without leaving copy-mode, so historical output stays at its current position; press `q` or `Esc` when finished.
+- Dragging text in a normal tmux pane copies it and returns to the original position, so historical output stays at its current location.
 - Terminal titles use the tmux session name, with Windows Terminal setup available as an explicit command.
 - `Ctrl-b H` toggles the sidebar; `Ctrl-b R` refreshes the current session name.
 
@@ -42,7 +42,7 @@ sudo apt update
 sudo apt install -y python3 tmux git
 git clone https://github.com/<your-account>/tmux-context.git ~/workspace/tmux-context
 cd ~/workspace/tmux-context
-chmod +x tmux-context install.sh scripts/build-package.sh
+chmod +x tmux-context install.sh
 ./install.sh
 ./tmux-context doctor
 ```
@@ -90,12 +90,6 @@ or from PowerShell:
 
 This backs up `settings.json`, sets `suppressApplicationTitle: false` for WSL profiles, and adds `Ctrl+Shift+F12` for the Windows Terminal tab-title editor. Close all Windows Terminal windows after changing settings. For an old manually fixed tab title, focus the tab, press `Ctrl+Shift+F12`, then `Ctrl+A`, `Backspace`, and `Enter`.
 
-## Migration from cs-session-manager
-
-Run `./tmux-context install` once. The installer removes the old managed `cs-session-manager` tmux source block and adds its own block; it saves a timestamped backup in `~/.tmux-context/tmux/backups/`. After migration, run only `tmux-context` commands to install or update tmux integration.
-
-The standalone tool does not read `~/.cs/index.jsonl`. Current Codex conversation detection and session naming continue to work from the Codex JSONL session file.
-
 ## Commands
 
 | Command | Purpose |
@@ -107,43 +101,9 @@ The standalone tool does not read `~/.cs/index.jsonl`. Current Codex conversatio
 | `./tmux-context client <session-id>` | Attach to an existing session with terminal-title monitoring |
 | `./tmux-context enable-windows-title` | Configure Windows Terminal WSL title support |
 
-## Build a portable archive
-
-```bash
-./scripts/build-package.sh
-```
-
-The command creates `dist/tmux-context-<version>.zip`. `dist/` is intentionally ignored by Git; publish it as a GitHub Release attachment if needed.
-
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 git diff --check
 ```
-
-## Publish to GitHub
-
-Choose a license before making the repository public; see [LICENSE-REQUIRED.md](LICENSE-REQUIRED.md). Then create an empty GitHub repository named `tmux-context` without an initial README or `.gitignore`.
-
-Run the following only after reviewing the staged files and explicitly deciding the repository visibility:
-
-```bash
-git init
-git add AGENTS.md README.md VERSION LICENSE-REQUIRED.md .gitignore \
-  tmux-context tmux-context.ps1 install.sh Install-TmuxContext.ps1 \
-  tmux_context.py scripts tests
-git status
-git commit -m "Initial release: tmux-context"
-git branch -M main
-git remote add origin git@github.com:<your-account>/tmux-context.git
-git push -u origin main
-```
-
-With GitHub CLI, replace the last three commands with:
-
-```bash
-gh repo create tmux-context --public --source=. --remote=origin --push
-```
-
-Do not commit `dist/`, Windows Terminal backups, `~/.tmux-context/`, Codex session files, tokens, or account configuration.
