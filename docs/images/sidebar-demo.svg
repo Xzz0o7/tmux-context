@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="680" viewBox="0 0 1120 680" role="img" aria-labelledby="title description">
+  <title id="title">tmux-context current-session sidebar example</title>
+  <desc id="description">A fictional tmux terminal with a current-session conversation sidebar. It contains no real user, account, path, or conversation data.</desc>
+  <rect width="1120" height="680" fill="#1c0718"/>
+  <rect x="0" y="0" width="1120" height="38" fill="#321028"/>
+  <rect x="12" y="5" width="240" height="28" rx="5" fill="#421536"/>
+  <rect x="258" y="3" width="286" height="32" rx="5" fill="#5a1b4c"/>
+  <rect x="550" y="5" width="238" height="28" rx="5" fill="#421536"/>
+  <text x="26" y="24" fill="#ccb9c9" font-family="monospace" font-size="13">Docs preview</text>
+  <text x="274" y="24" fill="#fff5ff" font-family="monospace" font-size="13" font-weight="bold">Keyboard controls</text>
+  <text x="566" y="24" fill="#ccb9c9" font-family="monospace" font-size="13">Release notes</text>
+  <text x="808" y="25" fill="#d9c9d8" font-family="monospace" font-size="22">+</text>
+  <rect x="0" y="38" width="756" height="642" fill="#260a21"/>
+  <rect x="756" y="38" width="364" height="642" fill="#170b16"/>
+  <rect x="756" y="38" width="4" height="642" fill="#b64aaf"/>
+  <text x="24" y="76" fill="#c7bac7" font-family="monospace" font-size="17">$ codex</text>
+  <text x="24" y="110" fill="#8fdbd1" font-family="monospace" font-size="17">› Review the keyboard controls for the sidebar</text>
+  <text x="24" y="154" fill="#d9d1d9" font-family="monospace" font-size="17">I will add a direct shortcut and keep mouse controls unchanged.</text>
+  <text x="24" y="188" fill="#d9d1d9" font-family="monospace" font-size="17">The sidebar remains attached to this current tmux session.</text>
+  <text x="24" y="244" fill="#8fdbd1" font-family="monospace" font-size="17">› Add a jump-to-top control for long conversations</text>
+  <text x="24" y="288" fill="#d9d1d9" font-family="monospace" font-size="17">Added the control and refreshed the sidebars.</text>
+  <text x="780" y="68" fill="#f5eafb" font-family="monospace" font-size="16" font-weight="bold">Current Session [Final] demo</text>
+  <text x="780" y="94" fill="#d5c9d4" font-family="monospace" font-size="14">Current: Sidebar interaction review</text>
+  <text x="780" y="116" fill="#9f90a0" font-family="monospace" font-size="14">Inputs: 4  Selected: 2/4</text>
+  <line x1="772" y1="130" x2="1102" y2="130" stroke="#76506f" stroke-width="1"/>
+  <text x="780" y="158" fill="#62d9e8" font-family="monospace" font-size="15">▶ 01</text>
+  <text x="830" y="158" fill="#d98ecf" font-family="monospace" font-size="15">2026-01-12</text>
+  <text x="928" y="158" fill="#f0ce70" font-family="monospace" font-size="15">09:15</text>
+  <text x="780" y="182" fill="#b9adb8" font-family="monospace" font-size="14">│ Show session history in a sidebar</text>
+  <line x1="772" y1="196" x2="1102" y2="196" stroke="#50344c" stroke-width="1"/>
+  <rect x="772" y="205" width="330" height="166" rx="4" fill="#2b1729"/>
+  <text x="780" y="232" fill="#62d9e8" font-family="monospace" font-size="15" font-weight="bold">▼ 02</text>
+  <text x="830" y="232" fill="#d98ecf" font-family="monospace" font-size="15" font-weight="bold">2026-01-12</text>
+  <text x="928" y="232" fill="#f0ce70" font-family="monospace" font-size="15" font-weight="bold">09:22</text>
+  <text x="780" y="258" fill="#eee7ed" font-family="monospace" font-size="14" font-weight="bold">│ You</text>
+  <text x="780" y="280" fill="#d5c9d4" font-family="monospace" font-size="14">│   Refine the keyboard controls</text>
+  <text x="780" y="310" fill="#eee7ed" font-family="monospace" font-size="14" font-weight="bold">│ AI</text>
+  <text x="780" y="332" fill="#b9adb8" font-family="monospace" font-size="14">│   Added a direct shortcut and</text>
+  <text x="780" y="352" fill="#b9adb8" font-family="monospace" font-size="14">│   preserved mouse selection.</text>
+  <line x1="772" y1="382" x2="1102" y2="382" stroke="#50344c" stroke-width="1"/>
+  <text x="780" y="410" fill="#62d9e8" font-family="monospace" font-size="15">▶ 03</text>
+  <text x="830" y="410" fill="#d98ecf" font-family="monospace" font-size="15">2026-01-12</text>
+  <text x="928" y="410" fill="#f0ce70" font-family="monospace" font-size="15">09:31</text>
+  <text x="780" y="434" fill="#b9adb8" font-family="monospace" font-size="14">│ Add a jump-to-top control</text>
+  <line x1="772" y1="450" x2="1102" y2="450" stroke="#50344c" stroke-width="1"/>
+  <text x="780" y="478" fill="#62d9e8" font-family="monospace" font-size="15">▶ 04</text>
+  <text x="830" y="478" fill="#d98ecf" font-family="monospace" font-size="15">2026-01-12</text>
+  <text x="928" y="478" fill="#f0ce70" font-family="monospace" font-size="15">09:38</text>
+  <text x="780" y="502" fill="#b9adb8" font-family="monospace" font-size="14">│ Verify the refreshed sidebar</text>
+  <rect x="772" y="622" width="330" height="38" fill="#321028"/>
+  <text x="784" y="647" fill="#f0e6ef" font-family="monospace" font-size="14">[Toggle] [Mode] [Search] [Top] [Latest]</text>
+</svg>

@@ -730,7 +730,7 @@ def wrap_display(text: object, width: int) -> list[str]:
     for character in value:
         character_width = terminal_character_width(character)
         if current and used + character_width > width:
-            lines.append("".join(current).rstrip())
+            lines.append("".join(current))
             current = []
             used = 0
         current.append(character)
@@ -858,6 +858,7 @@ class ArchiveSidebar:
         curses.echo()
         curses.curs_set(1)
         try:
+            window.timeout(-1)
             window.move(height - 1, 0)
             window.clrtoeol()
             window.addnstr(height - 1, 0, "/", width - 1)
@@ -869,6 +870,7 @@ class ArchiveSidebar:
         except curses.error:
             pass
         finally:
+            window.timeout(50)
             curses.noecho()
             curses.curs_set(0)
 
@@ -1137,9 +1139,23 @@ def transcript_time(value: object) -> str:
         return ""
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        return datetime.fromisoformat(normalized).astimezone().strftime("%H:%M")
+        return datetime.fromisoformat(normalized).astimezone().strftime("%Y-%m-%d %H:%M")
     except ValueError:
         return ""
+
+
+def transcript_header_field_ranges(text: str) -> list[tuple[int, int, str]]:
+    match = re.match(
+        r"^[▶▼]\s+(?P<number>\d+)\s+(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2})$",
+        text,
+    )
+    if not match:
+        return []
+    return [
+        (match.start("number"), match.end("number"), "number"),
+        (match.start("date"), match.end("date"), "date"),
+        (match.start("time"), match.end("time"), "time"),
+    ]
 
 
 def wrap_transcript_text(text: str, width: int) -> list[str]:
@@ -1150,6 +1166,116 @@ def wrap_transcript_text(text: str, width: int) -> list[str]:
             continue
         lines.extend(wrap_display(source_line, width) or [""])
     return lines
+
+
+def clean_sidebar_selection_text(text: str) -> str:
+    sections: list[str] = []
+    fragments: list[str] = []
+
+    def finish_section() -> None:
+        value = "".join(fragments).strip()
+        if value:
+            sections.append(value)
+        fragments.clear()
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r")
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"[─━]+", stripped) or re.match(r"^[▶▼]\s+\d+", stripped):
+            finish_section()
+            continue
+        if re.fullmatch(r"│\s*(?:你|AI(?:·过程)?)(?:\s+\d{2}:\d{2})?", line):
+            finish_section()
+            continue
+        if line == "│":
+            finish_section()
+            continue
+        if line.startswith("│   "):
+            fragments.append(line[4:])
+        elif line.startswith("│ "):
+            fragments.append(line[2:])
+        else:
+            fragments.append(line)
+    finish_section()
+    return "\n\n".join(sections)
+
+
+def copy_text_to_clipboard(text: str) -> str:
+    if not text:
+        return ""
+    if os.environ.get("WSL_DISTRO_NAME"):
+        windows_powershell = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        if windows_powershell.is_file():
+            try:
+                result = subprocess.run(
+                    [
+                        str(windows_powershell),
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                        "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+                    ],
+                    input=text.encode("utf-8"),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except OSError:
+                pass
+            else:
+                if result.returncode == 0:
+                    return "Windows clipboard"
+    commands = []
+    windows_clipboard = Path("/mnt/c/Windows/System32/clip.exe")
+    if os.environ.get("WSL_DISTRO_NAME") and windows_clipboard.is_file():
+        commands.append(([str(windows_clipboard)], "Windows clipboard"))
+    if shutil.which("wl-copy"):
+        commands.append((["wl-copy"], "Wayland clipboard"))
+    if shutil.which("xclip"):
+        commands.append((["xclip", "-selection", "clipboard"], "X11 clipboard"))
+    for command, destination in commands:
+        try:
+            result = subprocess.run(
+                command,
+                input=text,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            continue
+        if result.returncode == 0:
+            return destination
+    try:
+        result = subprocess.run(
+            ["tmux", "load-buffer", "-"],
+            input=text,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return ""
+    return "tmux buffer" if result.returncode == 0 else ""
+
+
+def copy_stdin_to_clipboard() -> int:
+    text = clean_sidebar_selection_text(sys.stdin.read())
+    if not text:
+        return 0
+    return 0 if copy_text_to_clipboard(text) else 1
+
+
+def copy_raw_stdin_to_clipboard() -> int:
+    text = sys.stdin.read()
+    if not text:
+        return 0
+    return 0 if copy_text_to_clipboard(text) else 1
 
 
 class Sidebar:
@@ -1174,6 +1300,9 @@ class Sidebar:
         self.selected_turn = 0
         self.expanded_turn_key = ""
         self.turn_ranges: list[tuple[int, int, int]] = []
+        self.transcript_generation = 0
+        self.transcript_cache_key: tuple | None = None
+        self.transcript_cache_lines: list[tuple[str, int]] = []
         self.ensure_selection = False
         self.footer_actions: list[tuple[int, int, str]] = []
         self.header_attr = curses.A_REVERSE
@@ -1183,11 +1312,14 @@ class Sidebar:
         self.collapsed_header_attr = curses.A_BOLD
         self.collapsed_body_attr = 0
         self.separator_attr = curses.A_DIM
-        self.selected_attr = curses.A_REVERSE | curses.A_BOLD
-        self.expanded_header_attr = curses.A_REVERSE | curses.A_BOLD
+        self.selected_attr = curses.A_BOLD | curses.A_UNDERLINE
+        self.expanded_header_attr = curses.A_BOLD | curses.A_UNDERLINE
         self.user_body_attr = curses.A_DIM
         self.ai_final_attr = curses.A_DIM
         self.ai_commentary_attr = curses.A_DIM
+        self.turn_number_attr = curses.A_BOLD
+        self.turn_date_attr = curses.A_BOLD | curses.A_UNDERLINE
+        self.turn_time_attr = curses.A_BOLD
         self.reload(force=True)
 
     def init_colors(self) -> None:
@@ -1206,6 +1338,9 @@ class Sidebar:
                 (1, default_foreground, default_background),
                 (4, default_foreground, curses.COLOR_MAGENTA),
                 (8, default_foreground, curses.COLOR_BLUE),
+                (9, curses.COLOR_CYAN, default_background),
+                (10, curses.COLOR_MAGENTA, default_background),
+                (11, curses.COLOR_YELLOW, default_background),
             )
             for pair_id, foreground, background in color_specs:
                 curses.init_pair(pair_id, foreground, background)
@@ -1218,14 +1353,18 @@ class Sidebar:
         self.collapsed_header_attr = curses.color_pair(1) | curses.A_BOLD
         self.collapsed_body_attr = curses.color_pair(1)
         self.separator_attr = curses.color_pair(1) | curses.A_DIM
-        self.selected_attr = curses.A_REVERSE | curses.A_BOLD
-        self.expanded_header_attr = curses.color_pair(4) | curses.A_BOLD | curses.A_UNDERLINE
+        self.selected_attr = curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE
+        self.expanded_header_attr = curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE
         self.user_body_attr = curses.color_pair(1) | curses.A_DIM
         self.ai_final_attr = curses.color_pair(1) | curses.A_DIM
         self.ai_commentary_attr = curses.color_pair(1) | curses.A_DIM
+        self.turn_number_attr = curses.color_pair(9) | curses.A_BOLD
+        self.turn_date_attr = curses.color_pair(10) | curses.A_BOLD
+        self.turn_time_attr = curses.color_pair(11) | curses.A_BOLD
 
     def reload(self, force: bool = False) -> None:
         now = time.monotonic()
+        previous_raw_path = self.raw_path
         if force or now - self.last_context_refresh >= 2:
             self.last_context_refresh = now
             source_cwd = tmux_value(self.source_pane, "#{pane_current_path}")
@@ -1253,10 +1392,10 @@ class Sidebar:
             raw_mtime = Path(self.raw_path).stat().st_mtime if self.raw_path else 0.0
         except OSError:
             raw_mtime = 0.0
-        if force or raw_mtime != self.raw_mtime:
+        if force or self.raw_path != previous_raw_path or raw_mtime != self.raw_mtime:
             self.raw_mtime = raw_mtime
             self.all_messages = load_current_session_messages(self.raw_path)
-        self.apply_filters()
+            self.apply_filters()
 
     def apply_filters(self) -> None:
         turns = group_session_turns(self.all_messages)
@@ -1277,6 +1416,8 @@ class Sidebar:
                 ).lower()
             ]
         self.turns = turns
+        self.transcript_generation += 1
+        self.transcript_cache_key = None
         if self.follow_latest and turns:
             self.selected_turn = len(turns) - 1
         else:
@@ -1289,6 +1430,7 @@ class Sidebar:
         curses.echo()
         curses.curs_set(1)
         try:
+            window.timeout(-1)
             window.move(height - 1, 0)
             window.clrtoeol()
             window.addnstr(height - 1, 0, "/", width - 1)
@@ -1303,11 +1445,19 @@ class Sidebar:
         except curses.error:
             pass
         finally:
+            window.timeout(50)
             curses.noecho()
             curses.curs_set(0)
 
     def transcript_lines(self, width: int) -> list[tuple[str, int]]:
+        cache_key = (width, self.transcript_generation, self.expanded_turn_key, self.selected_turn)
+        if cache_key == self.transcript_cache_key:
+            return self.transcript_cache_lines
         lines: list[tuple[str, int]] = []
+
+        def add_transcript_line(text: str, attr: int) -> None:
+            lines.append((text, attr))
+
         self.turn_ranges = []
         content_width = max(8, width - 5)
         separator = "─" * max(1, width - 1)
@@ -1326,28 +1476,33 @@ class Sidebar:
                 header_attr = self.selected_attr
             else:
                 header_attr = self.collapsed_header_attr
-            lines.append((header, header_attr))
+            add_transcript_line(header, header_attr)
             user_lines = wrap_transcript_text(str(user.get("text", "")), content_width)
             if expanded:
-                lines.append(("│ 你", self.user_body_attr | curses.A_UNDERLINE))
-                lines.extend((f"│   {line}" if line else "│", self.user_body_attr) for line in user_lines)
+                add_transcript_line("│ 你", self.user_body_attr | curses.A_UNDERLINE)
+                for line in user_lines:
+                    add_transcript_line(f"│   {line}" if line else "│", self.user_body_attr)
                 for reply in turn["replies"]:
                     phase = reply.get("phase")
                     label = "AI·过程" if phase == "commentary" else "AI"
                     attr = self.ai_commentary_attr if phase == "commentary" else self.ai_final_attr
                     reply_time = transcript_time(reply.get("timestamp"))
-                    lines.append((f"│ {label} {reply_time}".rstrip(), attr | curses.A_UNDERLINE))
+                    add_transcript_line(f"│ {label} {reply_time}".rstrip(), attr | curses.A_UNDERLINE)
                     reply_lines = wrap_transcript_text(str(reply.get("text", "")), content_width)
-                    lines.extend((f"│   {line}" if line else "│", attr) for line in reply_lines)
+                    for line in reply_lines:
+                        add_transcript_line(f"│   {line}" if line else "│", attr)
             else:
                 preview = user_lines[:2]
                 if len(user_lines) > 2 and preview:
                     preview[-1] = clip(preview[-1] + "…", content_width)
                 preview_attr = self.selected_attr if selected else self.collapsed_body_attr
-                lines.extend((f"│ {line}" if line else "│", preview_attr) for line in preview)
+                for line in preview:
+                    add_transcript_line(f"│ {line}" if line else "│", preview_attr)
             self.turn_ranges.append((start, len(lines) - 1, index))
             if index < len(self.turns) - 1:
-                lines.append((separator, self.separator_attr))
+                add_transcript_line(separator, self.separator_attr)
+        self.transcript_cache_key = cache_key
+        self.transcript_cache_lines = lines
         return lines
 
     def selected_range(self) -> tuple[int, int] | None:
@@ -1421,10 +1576,17 @@ class Sidebar:
             add_line(window, 4, "当前 session 暂无匹配输入")
         else:
             for row, (line, attr) in enumerate(lines[self.scroll_top : self.scroll_top + content_height], 3):
-                add_line(window, row, line, attr)
+                self.draw_transcript_line(window, row, line, attr)
         self.draw_action_bar(
             window,
-            [("Toggle", "toggle"), ("Mode", "mode"), ("Search", "search"), ("Latest", "latest"), ("Close", "close")],
+            [
+                ("Toggle", "toggle"),
+                ("Mode", "mode"),
+                ("Search", "search"),
+                ("Top", "top"),
+                ("Latest", "latest"),
+                ("Close", "close"),
+            ],
         )
 
     def draw_action_bar(self, window: curses.window, actions: list[tuple[str, str]]) -> None:
@@ -1440,6 +1602,28 @@ class Sidebar:
             position += token_width
         add_line(window, height - 1, text, self.footer_attr)
 
+    def draw_transcript_line(self, window: curses.window, row: int, text: str, attr: int) -> None:
+        add_line(window, row, text, attr)
+        fields = transcript_header_field_ranges(text)
+        if not fields:
+            return
+        attrs = {
+            "number": self.turn_number_attr,
+            "date": self.turn_date_attr,
+            "time": self.turn_time_attr,
+        }
+        try:
+            window.move(row, 0)
+            previous_end = 0
+            for start, end, field in fields:
+                window.addstr(text[previous_end:start], attr)
+                window.addstr(text[start:end], attrs[field])
+                previous_end = end
+            if previous_end < len(text):
+                window.addstr(text[previous_end:], attr)
+        except curses.error:
+            pass
+
     def scroll(self, amount: int) -> None:
         self.follow_latest = False
         self.scroll_top = min(max(0, self.scroll_top + amount), self.max_scroll)
@@ -1449,6 +1633,10 @@ class Sidebar:
     def run_action(self, action: str, window: curses.window) -> bool:
         if action == "toggle":
             self.toggle_selected()
+        elif action == "top":
+            self.follow_latest = False
+            self.selected_turn = 0
+            self.ensure_selection = True
         elif action == "latest":
             self.follow_latest = True
             self.expanded_turn_key = ""
@@ -1473,8 +1661,8 @@ class Sidebar:
             return False
         wheel_up = getattr(curses, "BUTTON4_PRESSED", 0)
         wheel_down = getattr(curses, "BUTTON5_PRESSED", 0)
-        left_click = (
-            getattr(curses, "BUTTON1_PRESSED", 0)
+        left_released = (
+            getattr(curses, "BUTTON1_RELEASED", 0)
             | getattr(curses, "BUTTON1_CLICKED", 0)
             | getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
         )
@@ -1484,16 +1672,19 @@ class Sidebar:
         if button_state & wheel_down:
             self.scroll(3)
             return False
-        if not button_state & left_click:
-            return False
         height, _ = window.getmaxyx()
+        position = None
+        if 3 <= mouse_y < height - 1:
+            position = (self.scroll_top + mouse_y - 3, mouse_x)
+        if not button_state & left_released:
+            return False
         if mouse_y == height - 1:
             for start, end, action in self.footer_actions:
                 if start <= mouse_x <= end:
                     return self.run_action(action, window)
             return False
-        if mouse_y >= 3:
-            absolute_line = self.scroll_top + mouse_y - 3
+        if position:
+            absolute_line = position[0]
             for start, end, index in self.turn_ranges:
                 if start <= absolute_line <= end:
                     self.selected_turn = index
@@ -1504,10 +1695,10 @@ class Sidebar:
     def run(self, window: curses.window) -> None:
         self.init_colors()
         curses.curs_set(0)
-        curses.mouseinterval(150)
+        curses.mouseinterval(0)
         curses.mousemask(curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0))
         window.keypad(True)
-        window.timeout(1000)
+        window.timeout(50)
         while True:
             self.reload()
             window.erase()
@@ -1606,6 +1797,9 @@ def generated_tmux_config(entrypoint: Path = ENTRYPOINT) -> str:
     return f"""# Generated by tmux-context install. Edit the tmux-context source instead.
 set -g focus-events on
 set -g mouse on
+bind-key -T root MouseDrag1Pane if-shell -F '#{{@session_context_sidebar}}' 'copy-mode -M' 'if-shell -F "#{{||:#{{alternate_on}},#{{pane_in_mode}},#{{mouse_any_flag}}}}" "send-keys -M" "copy-mode -M"'
+bind-key -T copy-mode MouseDragEnd1Pane if-shell -F '#{{@session_context_sidebar}}' {{ send-keys -X copy-pipe-and-cancel "{command} copy-stdin" }} {{ send-keys -X copy-pipe-and-cancel "{command} copy-raw-stdin" }}
+bind-key -T copy-mode-vi MouseDragEnd1Pane if-shell -F '#{{@session_context_sidebar}}' {{ send-keys -X copy-pipe-and-cancel "{command} copy-stdin" }} {{ send-keys -X copy-pipe-and-cancel "{command} copy-raw-stdin" }}
 set -g set-titles on
 set -g set-titles-string '#S'
 set -g status-interval 5
@@ -1907,6 +2101,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("uninstall")
     subparsers.add_parser("doctor")
     subparsers.add_parser("enable-windows-title")
+    subparsers.add_parser("copy-stdin")
+    subparsers.add_parser("copy-raw-stdin")
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--name", default="cs")
@@ -1938,6 +2134,10 @@ def main(argv: list[str] | None = None) -> int:
         return doctor_tmux_integration()
     elif args.command == "enable-windows-title":
         return enable_windows_terminal_titles()
+    elif args.command == "copy-stdin":
+        return copy_stdin_to_clipboard()
+    elif args.command == "copy-raw-stdin":
+        return copy_raw_stdin_to_clipboard()
     elif args.command == "run":
         launch_command = list(args.launch_command)
         if launch_command[:1] == ["--"]:

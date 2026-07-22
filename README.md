@@ -4,6 +4,12 @@
 
 It is a standalone extraction from `cs-session-manager`: no session index, archive database, or `cs` command is required.
 
+## Preview
+
+![Fictional tmux-context current-session sidebar example](docs/images/sidebar-demo.svg)
+
+This is a deliberately fictional demonstration. The tab strip shows different task-based session names, while the active tab shows its current-session sidebar. It contains no user name, account, filesystem path, host name, session ID, or real conversation content.
+
 ## Support boundary
 
 | Environment | Support | Notes |
@@ -20,6 +26,10 @@ PowerShell compatibility means that you can install, launch, diagnose, and attac
 - Session titles prioritize the most recent meaningful task whose Codex response has completed.
 - Weak text such as `继续`, raw shell commands, and image placeholders does not rename a session.
 - The current-session sidebar supports mouse selection, collapsing one prompt at a time, expanding AI replies, scrolling, filtering, and hiding/showing reasoning output.
+- In expanded text, one click sets a selection start; drag to an endpoint, or click the endpoint again, to copy only the selected body text. Headers, timestamps, and separators are excluded.
+- On WSL, selected text is copied through Windows PowerShell with UTF-8 input, preserving Chinese and other Unicode text.
+- Clipboard writes run in the background, so the selection highlight remains responsive while copying.
+- Dragging text in a normal tmux pane copies it without leaving copy-mode, so historical output stays at its current position; press `q` or `Esc` when finished.
 - Terminal titles use the tmux session name, with Windows Terminal setup available as an explicit command.
 - `Ctrl-b H` toggles the sidebar; `Ctrl-b R` refreshes the current session name.
 
@@ -40,10 +50,10 @@ chmod +x tmux-context install.sh scripts/build-package.sh
 Start an AI CLI from a regular shell so `tmux-context` can create the managed session and title watcher:
 
 ```bash
-./tmux-context run --name codexa -- codexa
+./tmux-context run --name assistant -- codex
 ```
 
-If `codexa` is not a shell command, replace it with the actual executable and arguments. Running `tmux-context run` inside an existing tmux client deliberately does not create a nested tmux server.
+If `codex` is not the command you use, replace it with the actual executable and arguments. Running `tmux-context run` inside an existing tmux client deliberately does not create a nested tmux server.
 
 ## Install and use from PowerShell
 
@@ -53,7 +63,7 @@ Clone the repository either in a Windows folder mounted by WSL (for example `C:\
 Set-ExecutionPolicy -Scope Process Bypass
 .\Install-TmuxContext.ps1 -Distribution Ubuntu
 .\tmux-context.ps1 doctor
-.\tmux-context.ps1 run --name codexa -- codexa
+.\tmux-context.ps1 run --name assistant -- codex
 ```
 
 `-Distribution` is optional when only one distribution is installed. If the repository is in a nonstandard WSL path, pass it explicitly:
@@ -82,7 +92,7 @@ This backs up `settings.json`, sets `suppressApplicationTitle: false` for WSL pr
 
 ## Migration from cs-session-manager
 
-Run `./tmux-context install` once. The installer removes the old managed `cs-session-manager` tmux source block and adds its own block; it saves a timestamped backup in `~/.tmux-context/tmux/backups/`. Do not run `cs tmux install` afterwards, because it would restore the old hook.
+Run `./tmux-context install` once. The installer removes the old managed `cs-session-manager` tmux source block and adds its own block; it saves a timestamped backup in `~/.tmux-context/tmux/backups/`. After migration, run only `tmux-context` commands to install or update tmux integration.
 
 The standalone tool does not read `~/.cs/index.jsonl`. Current Codex conversation detection and session naming continue to work from the Codex JSONL session file.
 
