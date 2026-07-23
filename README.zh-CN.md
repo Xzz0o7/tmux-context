@@ -4,6 +4,8 @@
 
 `tmux-context` 会依据已完成的 Codex 任务自动命名 tmux 会话，为当前对话显示支持鼠标操作的侧边栏，并同步兼容终端的标签标题。
 
+**作者网站：** [xzzoo7.com](https://xzzoo7.com/)
+
 ## 界面预览
 
 ![虚构的 tmux-context 当前会话侧边栏示例](docs/images/sidebar-demo.svg)

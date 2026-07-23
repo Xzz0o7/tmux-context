@@ -4,6 +4,8 @@
 
 `tmux-context` automatically names tmux sessions from the completed Codex task, shows a mouse-enabled sidebar for the current conversation, and keeps compatible terminal titles in sync.
 
+**Creator website:** [xzzoo7.com](https://xzzoo7.com/)
+
 ## Preview
 
 ![Fictional tmux-context current-session sidebar example](docs/images/sidebar-demo.svg)
