@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Context-aware tmux session naming and live Codex transcript sidebar."""
+"""Context-aware tmux session naming and live Codex/Claude Code transcript sidebar."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import curses
 from datetime import datetime
 import json
@@ -33,6 +34,11 @@ CS_MANAGER_BLOCK_END = "# cs-session-manager tmux end"
 MAX_HISTORY_BYTES = 4 * 1024 * 1024
 MAX_TRANSCRIPT_MESSAGE_CHARS = 20000
 SIDEBAR_WIDTH_PERCENT = 40
+CLAUDE_META_SCAN_LINES = 40
+CLAUDE_SCAN_FILE_LIMIT = 40
+CLAUDE_SCAN_DIR_LIMIT = 12
+CLAUDE_START_WINDOW_SECONDS = 300
+CLAUDE_META_CACHE: dict[str, tuple[int, int, str, str, float]] = {}
 TITLE_TASK_HINTS = (
     "怎么", "如何", "为什么", "是否", "能否", "查看", "检查", "分析", "修复",
     "实现", "添加", "修改", "删除", "优化", "配置", "适配", "迁移", "打包",
@@ -45,7 +51,7 @@ WEAK_TITLE_MESSAGES = {
     "开始", "完成", "重试", "再试一次", "直接改", "检查一下", "再检查一下",
     "查看一下", "看一下", "下一步", "下一步建议", "然后呢", "还有吗", "这个呢",
     "就这个", "没效果", "没有效果", "还是没有", "还是不行", "不行", "可以了",
-    "ok", "yes", "no", "codex", "codexa", "codexb", "ubuntu", "wsl", "bash",
+    "ok", "yes", "no", "codex", "codexa", "codexb", "claude", "ubuntu", "wsl", "bash",
 }
 COMPLETED_TITLE_CACHE: dict[str, tuple[int, int, str]] = {}
 TITLE_PATH_PATTERN = re.compile(
@@ -179,6 +185,27 @@ def process_command(process_id: int) -> str:
         return ""
 
 
+def process_cwd(process_id: int) -> str:
+    try:
+        return os.path.realpath(os.readlink(f"/proc/{process_id}/cwd"))
+    except OSError:
+        return ""
+
+
+def process_start_time(process_id: int) -> float:
+    try:
+        return Path(f"/proc/{process_id}").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def open_codex_session_path(process_id: int) -> Path | None:
     fd_dir = Path(f"/proc/{process_id}/fd")
     try:
@@ -237,7 +264,133 @@ def find_session_path(codex_home: str, thread_id: str) -> Path | None:
         return None
 
 
-def codex_identity(pane_id: str) -> tuple[str, str, str]:
+def claude_home_from_environment(environment: dict[str, str]) -> Path:
+    configured = environment.get("CLAUDE_CONFIG_DIR", "")
+    return Path(configured) if configured else Path.home() / ".claude"
+
+
+def claude_project_slug(cwd: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def claude_session_meta(session_path: Path) -> tuple[str, str, float]:
+    """Return (session_id, recorded cwd, first timestamp) from a Claude transcript head."""
+    key = str(session_path)
+    try:
+        stat = session_path.stat()
+    except OSError:
+        return "", "", 0.0
+    cached = CLAUDE_META_CACHE.get(key)
+    if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2], cached[3], cached[4]
+
+    session_id = ""
+    cwd = ""
+    first_timestamp = 0.0
+    try:
+        with session_path.open(errors="replace") as stream:
+            for _ in range(CLAUDE_META_SCAN_LINES):
+                line = stream.readline()
+                if not line:
+                    break
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                session_id = session_id or str(entry.get("sessionId") or "")
+                cwd = cwd or str(entry.get("cwd") or "")
+                if not first_timestamp:
+                    first_timestamp = transcript_timestamp(entry.get("timestamp"))
+                if session_id and cwd and first_timestamp:
+                    break
+    except OSError:
+        return "", "", 0.0
+
+    session_id = session_id or session_path.stem
+    CLAUDE_META_CACHE[key] = (stat.st_mtime_ns, stat.st_size, session_id, cwd, first_timestamp)
+    return session_id, cwd, first_timestamp
+
+
+def claude_candidate_paths(projects_dir: Path, cwd: str) -> list[Path]:
+    slug_dir = projects_dir / claude_project_slug(cwd)
+    if slug_dir.is_dir():
+        directories = [slug_dir]
+    else:
+        try:
+            entries = [item for item in projects_dir.iterdir() if item.is_dir()]
+        except OSError:
+            return []
+        entries.sort(key=lambda item: file_mtime(item), reverse=True)
+        directories = entries[:CLAUDE_SCAN_DIR_LIMIT]
+    paths = []
+    for directory in directories:
+        try:
+            paths.extend(item for item in directory.iterdir() if item.suffix == ".jsonl")
+        except OSError:
+            continue
+    paths.sort(key=lambda item: file_mtime(item), reverse=True)
+    return paths[:CLAUDE_SCAN_FILE_LIMIT]
+
+
+def claude_session_path(process_id: int, environment: dict[str, str]) -> Path | None:
+    """Claude Code closes its transcript between writes, so match it by cwd and start time."""
+    cwd = process_cwd(process_id)
+    projects_dir = claude_home_from_environment(environment) / "projects"
+    if not cwd or not projects_dir.is_dir():
+        return None
+    started = process_start_time(process_id)
+    fallback = None
+    best_path = None
+    best_distance = float("inf")
+    for path in claude_candidate_paths(projects_dir, cwd):
+        _, recorded_cwd, first_timestamp = claude_session_meta(path)
+        if recorded_cwd and os.path.realpath(recorded_cwd) != cwd:
+            continue
+        fallback = fallback or path
+        if not first_timestamp or not started:
+            continue
+        distance = abs(first_timestamp - started)
+        if distance <= CLAUDE_START_WINDOW_SECONDS and distance < best_distance:
+            best_distance = distance
+            best_path = path
+    return best_path or fallback
+
+
+def is_claude_process(command: str) -> bool:
+    return any(
+        name == "claude" or name.startswith("claude-") or name.startswith("claude.")
+        for name in (Path(token).name.lower() for token in command.split() if token)
+    )
+
+
+def codex_process_identity(process_id: int, detected_home: str) -> tuple[tuple[str, str, str] | None, str]:
+    environment = process_environment(process_id)
+    detected_home = environment.get("CODEX_HOME", "") or detected_home
+    thread_id = environment.get("CODEX_THREAD_ID", "")
+    session_path = open_codex_session_path(process_id)
+    if session_path:
+        thread_id = session_id_from_path(session_path)
+        codex_home = detected_home or codex_home_from_session_path(session_path)
+        if thread_id:
+            return (thread_id, codex_home, str(session_path)), detected_home
+    if thread_id:
+        codex_home = detected_home or str(Path.home() / ".codex")
+        session_path = find_session_path(codex_home, thread_id)
+        return (thread_id, codex_home, str(session_path or "")), detected_home
+    return None, detected_home
+
+
+def claude_process_identity(process_id: int) -> tuple[str, str, str] | None:
+    environment = process_environment(process_id)
+    claude_home = claude_home_from_environment(environment)
+    session_path = claude_session_path(process_id, environment)
+    if not session_path:
+        return None
+    thread_id, _, _ = claude_session_meta(session_path)
+    return thread_id, str(claude_home), str(session_path)
+
+
+def agent_identity(pane_id: str) -> tuple[str, str, str]:
     pane_pid_text = tmux_value(pane_id, "#{pane_pid}")
     try:
         pane_pid = int(pane_pid_text)
@@ -246,21 +399,16 @@ def codex_identity(pane_id: str) -> tuple[str, str, str]:
 
     detected_home = ""
     for process_id in reversed(process_descendants(pane_pid)):
-        if "codex" not in process_command(process_id).lower():
+        command = process_command(process_id)
+        if "codex" in command.lower():
+            identity, detected_home = codex_process_identity(process_id, detected_home)
+            if identity:
+                return identity
             continue
-        environment = process_environment(process_id)
-        detected_home = environment.get("CODEX_HOME", "") or detected_home
-        thread_id = environment.get("CODEX_THREAD_ID", "")
-        session_path = open_codex_session_path(process_id)
-        if session_path:
-            thread_id = session_id_from_path(session_path)
-            codex_home = detected_home or codex_home_from_session_path(session_path)
-            if thread_id:
-                return thread_id, codex_home, str(session_path)
-        if thread_id:
-            codex_home = detected_home or str(Path.home() / ".codex")
-            session_path = find_session_path(codex_home, thread_id)
-            return thread_id, codex_home, str(session_path or "")
+        if is_claude_process(command):
+            identity = claude_process_identity(process_id)
+            if identity:
+                return identity
     return "", detected_home, ""
 
 
@@ -311,6 +459,19 @@ def clean_title(text: str, limit: int = 34) -> str:
     return compact
 
 
+def read_transcript_lines(raw_path: str, max_bytes: int = MAX_HISTORY_BYTES) -> list[str]:
+    try:
+        with Path(raw_path).open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            start = max(0, size - max_bytes)
+            stream.seek(start)
+            if start:
+                stream.readline()
+            return stream.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+
+
 def completed_context_title(raw_path: str) -> str:
     if not raw_path:
         return ""
@@ -322,42 +483,16 @@ def completed_context_title(raw_path: str) -> str:
     cached = COMPLETED_TITLE_CACHE.get(raw_path)
     if cached and cached[:2] == cache_key:
         return cached[2]
-    try:
-        with Path(raw_path).open("rb") as stream:
-            size = stream.seek(0, os.SEEK_END)
-            start = max(0, size - MAX_HISTORY_BYTES)
-            stream.seek(start)
-            if start:
-                stream.readline()
-            lines = stream.read().decode(errors="replace").splitlines()
-    except OSError:
-        return ""
+    lines = read_transcript_lines(raw_path)
 
     completed_messages = []
-    current_user_message = ""
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("type") != "response_item":
-            continue
-        payload = entry.get("payload") or {}
-        if payload.get("type") != "message":
-            continue
-        text = "\n".join(
-            str(item.get("text", "")).strip()
-            for item in payload.get("content") or []
-            if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text", "").strip()
-        )
-        if payload.get("role") == "user":
-            if text.startswith("# AGENTS.md instructions for ") and "<environment_context>" in text:
-                continue
-            current_user_message = text
-        elif payload.get("role") == "assistant" and payload.get("phase") in ("final", "final_answer"):
-            if current_user_message:
-                completed_messages.append(current_user_message)
-                current_user_message = ""
+    pending_user_messages: list[str] = []
+    for message in transcript_messages(lines, raw_path):
+        if message["role"] == "user":
+            pending_user_messages.append(message["text"])
+        elif is_final_reply(message) and pending_user_messages:
+            completed_messages.extend(pending_user_messages)
+            pending_user_messages.clear()
 
     for message in reversed(completed_messages):
         title = meaningful_title(message)
@@ -438,10 +573,18 @@ def context_title(thread_id: str, raw_path: str, records: list[dict] | None = No
     return title
 
 
-def current_context(pane_id: str, records: list[dict] | None = None) -> tuple[str, str, bool, str]:
-    thread_id, codex_home, raw_path = codex_identity(pane_id)
+def current_context(pane_id: str, records: list[dict] | None = None) -> tuple[str, str, str, str]:
+    thread_id, agent_home, raw_path = agent_identity(pane_id)
     title = context_title(thread_id, raw_path, records)
-    return thread_id, title, bool(codex_home), raw_path
+    return thread_id, title, agent_home, raw_path
+
+
+def agent_label(raw_path: str, agent_home: str = "") -> str:
+    if is_claude_transcript(raw_path) or Path(agent_home).name.startswith(".claude"):
+        return "Claude"
+    if raw_path or agent_home:
+        return "Codex"
+    return ""
 
 
 def safe_name(value: str) -> str:
@@ -454,6 +597,9 @@ def safe_name(value: str) -> str:
 def source_name_from_raw_path(raw_path: str) -> str:
     path = Path(raw_path)
     for parent in path.parents:
+        if parent.name == "projects" and parent.parent.name.startswith(".claude"):
+            home_name = parent.parent.name
+            return "claude" if home_name == ".claude" else safe_name(home_name.lstrip("."))
         if parent.name != "sessions":
             continue
         home_name = parent.parent.name
@@ -809,7 +955,8 @@ class ArchiveSidebar:
         self.thread_id = ""
         self.current_title = ""
         self.context_live = False
-        self.codex_active = False
+        self.agent_active = False
+        self.agent_label = ""
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -827,8 +974,9 @@ class ArchiveSidebar:
             if source_cwd and source_cwd != self.cwd:
                 self.cwd = source_cwd
                 _, _, self.project_path = project_context(source_cwd)
-            live_thread_id, live_title, codex_active, _ = current_context(self.source_pane, self.all_records)
-            self.codex_active = codex_active
+            live_thread_id, live_title, agent_home, live_raw_path = current_context(self.source_pane, self.all_records)
+            self.agent_active = bool(agent_home)
+            self.agent_label = agent_label(live_raw_path, agent_home)
             if live_title:
                 self.thread_id = live_thread_id
                 self.current_title = live_title
@@ -884,12 +1032,12 @@ class ArchiveSidebar:
         if self.current_title:
             label = "当前" if self.context_live else "最近"
             context = self.current_title
-        elif self.codex_active:
+        elif self.agent_active:
             label = "当前"
-            context = "Codex 已启动，等待首条消息"
+            context = f"{self.agent_label or 'AI CLI'} 已启动，等待首条消息"
         else:
             label = "当前"
-            context = "此 tmux session 未运行 Codex"
+            context = "此 tmux session 未运行 Codex / Claude"
         add_line(window, 1, f"{label}: {clip(context, width - 4)}", curses.A_BOLD)
         query_text = f"搜索: {self.query}" if self.query else "搜索: -"
         add_line(window, 2, query_text)
@@ -1071,51 +1219,166 @@ class ArchiveSidebar:
                 self.reload(force=True)
 
 
-def load_current_session_messages(raw_path: str) -> list[dict]:
+def is_claude_transcript(raw_path: str) -> bool:
+    parts = Path(raw_path).parts
+    return "projects" in parts and any(part.startswith(".claude") for part in parts)
+
+
+def is_final_reply(message: dict) -> bool:
+    return message.get("role") == "assistant" and message.get("phase") in ("final", "final_answer")
+
+
+def clip_transcript_text(text: str) -> str:
+    if len(text) > MAX_TRANSCRIPT_MESSAGE_CHARS:
+        return text[: MAX_TRANSCRIPT_MESSAGE_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def transcript_messages(lines: Iterable[str], raw_path: str) -> list[dict]:
+    parse = claude_transcript_messages if is_claude_transcript(raw_path) else codex_transcript_messages
+    return parse(lines)
+
+
+def codex_transcript_messages(lines: Iterable[str]) -> list[dict]:
     messages = []
-    if not raw_path:
-        return messages
-    try:
-        stream = Path(raw_path).open(errors="replace")
-    except OSError:
-        return messages
-    with stream:
-        for line in stream:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "response_item":
+            continue
+        payload = entry.get("payload") or {}
+        if payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        chunks = []
+        for item in payload.get("content") or []:
+            if not isinstance(item, dict):
                 continue
-            if entry.get("type") != "response_item":
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+        text = "\n".join(chunks).strip()
+        if not text:
+            continue
+        if role == "user" and text.startswith("# AGENTS.md instructions for ") and "<environment_context>" in text:
+            continue
+        messages.append(
+            {
+                "role": role,
+                "phase": payload.get("phase") or "",
+                "text": clip_transcript_text(text),
+                "timestamp": entry.get("timestamp") or "",
+            }
+        )
+    return messages
+
+
+def claude_block_text(content: object, kinds: tuple[str, ...]) -> str:
+    if isinstance(content, str):
+        return content.strip() if "text" in kinds else ""
+    if not isinstance(content, list):
+        return ""
+    chunks = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type") or "text"
+        if kind not in kinds:
+            continue
+        text = item.get("thinking") if kind == "thinking" else item.get("text")
+        if isinstance(text, str) and text.strip():
+            chunks.append(text.strip())
+    return "\n".join(chunks).strip()
+
+
+CLAUDE_NOISE_USER_PATTERN = re.compile(
+    r"^(?:\[Request interrupted|Caveat: The messages below|API Error|<local-command-stdout>)",
+)
+
+
+def clean_claude_user_text(text: str) -> str:
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", " ", text, flags=re.DOTALL)
+    text = re.sub(r"</?(?:command-name|command-message|command-args|local-command-stdout)>", " ", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def claude_transcript_messages(lines: Iterable[str]) -> list[dict]:
+    """Claude Code writes one JSON record per line, with tool traffic mixed into the roles."""
+    messages = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role = entry.get("type")
+        if role not in ("user", "assistant") or entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        timestamp = entry.get("timestamp") or ""
+        if role == "user":
+            raw_text = claude_block_text(message.get("content"), ("text",))
+            if not raw_text or CLAUDE_NOISE_USER_PATTERN.match(raw_text):
                 continue
-            payload = entry.get("payload") or {}
-            if payload.get("type") != "message":
-                continue
-            role = payload.get("role")
-            if role not in ("user", "assistant"):
-                continue
-            chunks = []
-            for item in payload.get("content") or []:
-                if not isinstance(item, dict):
-                    continue
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    chunks.append(text.strip())
-            text = "\n".join(chunks).strip()
+            text = clean_claude_user_text(raw_text)
             if not text:
                 continue
-            if role == "user" and text.startswith("# AGENTS.md instructions for ") and "<environment_context>" in text:
-                continue
-            if len(text) > MAX_TRANSCRIPT_MESSAGE_CHARS:
-                text = text[: MAX_TRANSCRIPT_MESSAGE_CHARS - 1].rstrip() + "…"
+            messages.append({"role": "user", "phase": "", "text": clip_transcript_text(text), "timestamp": timestamp})
+            continue
+        reasoning = claude_block_text(message.get("content"), ("thinking",))
+        if reasoning:
             messages.append(
                 {
-                    "role": role,
-                    "phase": payload.get("phase") or "",
-                    "text": text,
-                    "timestamp": entry.get("timestamp") or "",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "text": clip_transcript_text(reasoning),
+                    "timestamp": timestamp,
                 }
             )
+        answer = claude_block_text(message.get("content"), ("text",))
+        if answer:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "phase": "final",
+                    "text": clip_transcript_text(answer),
+                    "timestamp": timestamp,
+                }
+            )
+    return mark_claude_intermediate_replies(messages)
+
+
+def mark_claude_intermediate_replies(messages: list[dict]) -> list[dict]:
+    """Only the last answer of a turn is the final one; earlier ones narrate tool work."""
+    answer_indexes: list[int] = []
+
+    def demote() -> None:
+        for index in answer_indexes[:-1]:
+            messages[index]["phase"] = "commentary"
+        answer_indexes.clear()
+
+    for index, message in enumerate(messages):
+        if message["role"] == "user":
+            demote()
+        elif message["phase"] == "final":
+            answer_indexes.append(index)
+    demote()
     return messages
+
+
+def load_current_session_messages(raw_path: str) -> list[dict]:
+    if not raw_path:
+        return []
+    try:
+        with Path(raw_path).open(encoding="utf-8", errors="replace") as stream:
+            return transcript_messages(stream, raw_path)
+    except OSError:
+        return []
 
 
 def group_session_turns(messages: list[dict]) -> list[dict]:
@@ -1132,6 +1395,16 @@ def group_session_turns(messages: list[dict]) -> list[dict]:
         elif turns:
             turns[-1]["replies"].append(message)
     return turns
+
+
+def transcript_timestamp(value: object) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def transcript_time(value: object) -> str:
@@ -1287,7 +1560,8 @@ class Sidebar:
         self.raw_path = ""
         self.current_title = ""
         self.context_live = False
-        self.codex_active = False
+        self.agent_active = False
+        self.agent_label = ""
         self.all_messages: list[dict] = []
         self.turns: list[dict] = []
         self.include_commentary = True
@@ -1370,8 +1644,9 @@ class Sidebar:
             source_cwd = tmux_value(self.source_pane, "#{pane_current_path}")
             if source_cwd:
                 self.cwd = source_cwd
-            live_thread_id, live_title, codex_active, live_raw_path = current_context(self.source_pane)
-            self.codex_active = codex_active
+            live_thread_id, live_title, agent_home, live_raw_path = current_context(self.source_pane)
+            self.agent_active = bool(agent_home)
+            self.agent_label = agent_label(live_raw_path or self.raw_path, agent_home)
             if live_thread_id:
                 self.thread_id = live_thread_id
             else:
@@ -1534,12 +1809,12 @@ class Sidebar:
         if self.current_title:
             label = "当前" if self.context_live else "最近"
             context = self.current_title
-        elif self.codex_active:
+        elif self.agent_active:
             label = "当前"
-            context = "Codex 已启动，等待首条消息"
+            context = f"{self.agent_label or 'AI CLI'} 已启动，等待首条消息"
         else:
             label = "当前"
-            context = "此 tmux session 未运行 Codex"
+            context = "此 tmux session 未运行 Codex / Claude"
         add_line(window, 1, f"{label}: {clip(context, width - 4)}", self.title_attr)
         if self.query:
             query_text = f"搜索: {self.query}  输入: {len(self.turns)}"
@@ -1571,7 +1846,7 @@ class Sidebar:
             self.ensure_selection = False
 
         if not self.raw_path:
-            add_line(window, 4, "等待当前 Codex session 文件…")
+            add_line(window, 4, f"等待当前 {self.agent_label or 'AI CLI'} session 文件…")
         elif not self.turns:
             add_line(window, 4, "当前 session 暂无匹配输入")
         else:

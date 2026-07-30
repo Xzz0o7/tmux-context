@@ -12,8 +12,14 @@ if str(PROJECT_ROOT) not in os.sys.path:
 
 import tmux_context
 from tmux_context import (
+    claude_project_slug,
+    claude_session_path,
+    claude_transcript_messages,
     clean_sidebar_selection_text,
     completed_context_title,
+    is_claude_process,
+    is_claude_transcript,
+    load_current_session_messages,
     copy_raw_stdin_to_clipboard,
     copy_stdin_to_clipboard,
     copy_text_to_clipboard,
@@ -170,6 +176,32 @@ class TmuxContextTest(unittest.TestCase):
             clean_sidebar_selection_text("│   hello \n│   world\n"),
             "hello world",
         )
+
+    def test_current_session_loader_keeps_messages_before_history_window(self):
+        def message(text: str) -> dict:
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-session.jsonl"
+            entries = [
+                message("最早记录"),
+                {"type": "event_msg", "payload": {"text": "x" * (tmux_context.MAX_HISTORY_BYTES + 1)}},
+                message("最新记录"),
+            ]
+            with path.open("w", encoding="utf-8") as stream:
+                for entry in entries:
+                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            messages = load_current_session_messages(str(path))
+
+        self.assertEqual([item["text"] for item in messages], ["最早记录", "最新记录"])
 
     def test_sidebar_mouse_toggles_only_after_left_release(self):
         sidebar = object.__new__(tmux_context.Sidebar)
@@ -436,6 +468,121 @@ class TmuxContextTest(unittest.TestCase):
         self.assertIn("codexa resume session-id", run_tmux.call_args_list[1].args[-1])
         self.assertEqual(run_tmux.call_args_list[2].args[-1], "codexa")
         attach.assert_called_once_with("$9")
+
+
+class ClaudeTranscriptTest(unittest.TestCase):
+    def write_transcript(self, directory: Path, name: str, entries: list[dict]) -> Path:
+        path = directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        return path
+
+    def user_entry(self, text: str, **extra: object) -> dict:
+        return {"type": "user", "message": {"role": "user", "content": text}, **extra}
+
+    def assistant_entry(self, blocks: list[dict], **extra: object) -> dict:
+        return {"type": "assistant", "message": {"role": "assistant", "content": blocks}, **extra}
+
+    def test_claude_project_slug_matches_transcript_directory(self):
+        self.assertEqual(claude_project_slug("/home/user/work.repo"), "-home-user-work-repo")
+
+    def test_is_claude_process_ignores_unrelated_commands(self):
+        self.assertTrue(is_claude_process("claude "))
+        self.assertTrue(is_claude_process("/home/user/.local/bin/claude --resume"))
+        self.assertFalse(is_claude_process("/bin/bash -c source /home/user/.claude/shell-snapshots/snapshot-bash.sh"))
+        self.assertFalse(is_claude_process("codex resume session-id"))
+
+    def test_is_claude_transcript_detects_claude_project_layout(self):
+        self.assertTrue(is_claude_transcript("/home/user/.claude/projects/-home-user/session.jsonl"))
+        self.assertFalse(is_claude_transcript("/home/user/.codex/sessions/2026/rollout-session.jsonl"))
+
+    def test_source_name_from_raw_path_reports_claude_home(self):
+        self.assertEqual(
+            source_name_from_raw_path("/home/user/.claude/projects/-home-user/session.jsonl"),
+            "claude",
+        )
+        self.assertEqual(
+            source_name_from_raw_path("/home/user/.claude_work/projects/-home-user/session.jsonl"),
+            "claude_work",
+        )
+
+    def test_claude_transcript_keeps_only_the_last_answer_of_a_turn(self):
+        messages = claude_transcript_messages([
+            json.dumps(self.user_entry("适配 Claude Code 侧边栏")),
+            json.dumps(self.assistant_entry([{"type": "thinking", "thinking": "先看进程"}])),
+            json.dumps(self.assistant_entry([{"type": "text", "text": "我先查一下进程"}])),
+            json.dumps(self.assistant_entry([{"type": "tool_use", "name": "Bash", "input": {}}])),
+            json.dumps(self.assistant_entry([{"type": "text", "text": "已完成适配"}])),
+        ])
+
+        self.assertEqual(
+            [(message["role"], message["phase"], message["text"]) for message in messages],
+            [
+                ("user", "", "适配 Claude Code 侧边栏"),
+                ("assistant", "commentary", "先看进程"),
+                ("assistant", "commentary", "我先查一下进程"),
+                ("assistant", "final", "已完成适配"),
+            ],
+        )
+
+    def test_claude_transcript_skips_tool_traffic_and_injected_text(self):
+        messages = claude_transcript_messages([
+            json.dumps(self.user_entry("正文 <system-reminder>忽略我</system-reminder>")),
+            json.dumps(self.user_entry("[Request interrupted by user for tool use]")),
+            json.dumps(self.user_entry("子代理提问", isSidechain=True)),
+            json.dumps(self.user_entry("环境说明", isMeta=True)),
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "tool_result", "content": "命令输出"}]},
+            }),
+            json.dumps({"type": "attachment", "attachment": {"type": "file"}}),
+        ])
+
+        self.assertEqual([message["text"] for message in messages], ["正文"])
+
+    def test_completed_context_title_reads_claude_transcript(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self.write_transcript(
+                Path(tmpdir) / ".claude" / "projects" / "-home-user",
+                "session.jsonl",
+                [
+                    self.user_entry("适配 Claude Code 的当前会话侧边栏"),
+                    self.user_entry("继续"),
+                    self.assistant_entry([{"type": "text", "text": "已完成"}]),
+                    self.user_entry("尚未回答的提问"),
+                ],
+            )
+
+            self.assertEqual(
+                completed_context_title(str(path)),
+                "适配 Claude Code 的当前会话侧边栏",
+            )
+            self.assertEqual(len(load_current_session_messages(str(path))), 4)
+
+    def test_claude_session_path_prefers_transcript_started_with_the_process(self):
+        started = 1785000000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cwd = str(root / "repo")
+            projects = root / "projects" / claude_project_slug(cwd)
+            for name, offset in (("old.jsonl", -7200), ("current.jsonl", 12)):
+                stamp = datetime.fromtimestamp(started + offset).astimezone().isoformat()
+                self.write_transcript(projects, name, [{
+                    "type": "user",
+                    "sessionId": name.removesuffix(".jsonl"),
+                    "cwd": cwd,
+                    "timestamp": stamp,
+                    "message": {"role": "user", "content": "提问"},
+                }])
+            os.utime(projects / "old.jsonl", (started + 900, started + 900))
+
+            with mock.patch("tmux_context.process_cwd", return_value=cwd), \
+                    mock.patch("tmux_context.process_start_time", return_value=started):
+                path = claude_session_path(4242, {"CLAUDE_CONFIG_DIR": str(root)})
+
+        self.assertEqual(Path(path).name, "current.jsonl")
 
 
 if __name__ == "__main__":

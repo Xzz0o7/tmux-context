@@ -2,7 +2,7 @@
 
 [中文文档](README.zh-CN.md)
 
-`tmux-context` automatically names tmux sessions from the completed Codex task, shows a mouse-enabled sidebar for the current conversation, and keeps compatible terminal titles in sync.
+`tmux-context` automatically names tmux sessions from the completed Codex or Claude Code task, shows a mouse-enabled sidebar for the current conversation, and keeps compatible terminal titles in sync.
 
 **Creator website:** [xzzoo7.com](https://xzzoo7.com/)
 
@@ -23,11 +23,21 @@ This is a deliberately fictional demonstration. The tab strip shows different ta
 
 PowerShell compatibility means that you can install, launch, diagnose, and attach from PowerShell while the session itself runs in WSL. It does not ship a separate Windows tmux implementation.
 
+## Supported AI CLIs
+
+| CLI | Transcript | Detection |
+|---|---|---|
+| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | Open file descriptor of the pane process, or `CODEX_THREAD_ID` |
+| Claude Code | `$CLAUDE_CONFIG_DIR/projects/<cwd slug>/<session-id>.jsonl` | Pane process working directory, matched to the transcript that started with it |
+
+Claude Code closes its transcript between writes, so the session is matched by the recorded `cwd` and the closest transcript start time. Concurrent Claude sessions in the same directory therefore stay on their own sidebar.
+
 ## Features
 
-- Session titles prioritize the most recent meaningful task whose Codex response has completed.
+- Session titles prioritize the most recent meaningful task whose Codex or Claude Code response has completed.
 - Weak text such as `继续`, raw shell commands, and image placeholders does not rename a session.
 - The current-session sidebar supports mouse selection, collapsing one prompt at a time, expanding AI replies, scrolling, filtering, and hiding/showing reasoning output.
+- Claude Code thinking blocks and interim answers between tool calls are treated as reasoning output, so only the closing answer of a turn is shown in the final-answer view.
 - Click a conversation once to expand or collapse it. Drag text in an expanded conversation to copy only the selected body text; headers, timestamps, and separators are excluded.
 - On WSL, selected text is copied through Windows PowerShell with UTF-8 input, preserving Chinese and other Unicode text.
 - Clipboard writes run in the background, so the selection highlight remains responsive while copying.
@@ -53,9 +63,10 @@ Start an AI CLI from a regular shell so `tmux-context` can create the managed se
 
 ```bash
 ./tmux-context run --name assistant -- codex
+./tmux-context run --name assistant -- claude
 ```
 
-If `codex` is not the command you use, replace it with the actual executable and arguments. Running `tmux-context run` inside an existing tmux client deliberately does not create a nested tmux server.
+If neither `codex` nor `claude` is the command you use, replace it with the actual executable and arguments. Running `tmux-context run` inside an existing tmux client deliberately does not create a nested tmux server.
 
 ## Install and use from PowerShell
 

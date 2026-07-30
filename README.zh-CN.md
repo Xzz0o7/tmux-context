@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-`tmux-context` 会依据已完成的 Codex 任务自动命名 tmux 会话，为当前对话显示支持鼠标操作的侧边栏，并同步兼容终端的标签标题。
+`tmux-context` 会依据已完成的 Codex 或 Claude Code 任务自动命名 tmux 会话，为当前对话显示支持鼠标操作的侧边栏，并同步兼容终端的标签标题。
 
 **作者网站：** [xzzoo7.com](https://xzzoo7.com/)
 
@@ -23,11 +23,21 @@
 
 PowerShell 兼容表示可以从 PowerShell 安装、启动、诊断和连接会话，但实际会话仍在 WSL 中运行；本项目不提供独立的 Windows 原生 tmux 实现。
 
+## 支持的 AI CLI
+
+| CLI | 会话记录 | 识别方式 |
+|---|---|---|
+| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | pane 进程打开的文件描述符，或 `CODEX_THREAD_ID` |
+| Claude Code | `$CLAUDE_CONFIG_DIR/projects/<cwd 目录名>/<session-id>.jsonl` | pane 进程的工作目录，配合最接近的会话起始时间 |
+
+Claude Code 每次写入后都会关闭会话文件，因此改用记录中的 `cwd` 与进程启动时间来匹配；同一目录下同时运行的多个 Claude 会话也能各自对应到自己的侧边栏。
+
 ## 功能
 
-- 会话标题优先采用最近一个已收到完成响应的、有意义的 Codex 任务。
+- 会话标题优先采用最近一个已收到完成响应的、有意义的 Codex 或 Claude Code 任务。
 - `继续`、原始 shell 命令和图片占位符等弱文本不会触发会话重命名。
 - 当前会话侧边栏支持鼠标操作、逐条折叠输入、展开 AI 回复、滚动、筛选，以及隐藏或显示推理过程。
+- Claude Code 的思考内容与工具调用之间的中间回复都归为过程输出，「仅最终」视图只保留每轮的收尾回复。
 - 单击一条会话可展开或折叠；在展开内容中拖动可仅复制选中的正文，标题、时间戳和分隔线不会被复制。
 - 在 WSL 中，选中内容会经由 Windows PowerShell 使用 UTF-8 写入 Windows 剪贴板，保留中文和其他 Unicode 字符。
 - 剪贴板写入在后台执行，复制时的选中高亮保持及时响应。
@@ -53,9 +63,10 @@ chmod +x tmux-context install.sh
 
 ```bash
 ./tmux-context run --name assistant -- codex
+./tmux-context run --name assistant -- claude
 ```
 
-如果你实际使用的命令不是 `codex`，请替换成对应的可执行文件及参数。在已有 tmux client 内执行 `tmux-context run` 时，程序不会再嵌套创建 tmux server。
+如果你实际使用的命令既不是 `codex` 也不是 `claude`，请替换成对应的可执行文件及参数。在已有 tmux client 内执行 `tmux-context run` 时，程序不会再嵌套创建 tmux server。
 
 ## 从 PowerShell 安装和使用
 
