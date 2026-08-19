@@ -39,6 +39,7 @@ from tmux_context import (
     transcript_header_field_ranges,
     transcript_time,
     unique_session_name,
+    watch_terminal_title,
     wrap_transcript_text,
 )
 
@@ -65,7 +66,10 @@ class TmuxContextTest(unittest.TestCase):
         self.assertIn('"/opt/tmux-context/tmux-context" rename', config)
         self.assertNotIn("sync-title", config)
         self.assertIn('"/opt/tmux-context/tmux-context" toggle', config)
-        self.assertIn("set-titles-string '#S'", config)
+        self.assertIn(
+            "set-titles-string '#{?#{m:? *,#{pane_title}},#{s/ .*//:pane_title} ,}#S'",
+            config,
+        )
         self.assertIn(
             "bind-key -T root MouseDrag1Pane if-shell -F '#{@session_context_sidebar}' 'copy-mode -M'",
             config,
@@ -272,6 +276,26 @@ class TmuxContextTest(unittest.TestCase):
             title = title_for_client("/dev/pts/2")
 
         self.assertEqual(title, "target")
+
+    def test_terminal_title_watcher_writes_only_when_title_changes(self):
+        stop_event = mock.Mock()
+        stop_event.is_set.side_effect = [False, False, False, True]
+        titles = iter(["session-one", "session-one", "session-two"])
+
+        with (
+            mock.patch("tmux_context.title_for_client", side_effect=lambda _: next(titles)),
+            mock.patch("tmux_context.os.write") as write,
+        ):
+            watch_terminal_title("/dev/pts/2", 9, stop_event)
+
+        self.assertEqual(
+            write.call_args_list,
+            [
+                mock.call(9, terminal_title_sequence("session-one")),
+                mock.call(9, terminal_title_sequence("session-two")),
+            ],
+        )
+        self.assertEqual(stop_event.wait.call_count, 3)
 
     def test_configure_windows_terminal_title_settings_is_idempotent(self):
         data = {

@@ -2076,7 +2076,7 @@ bind-key -T root MouseDrag1Pane if-shell -F '#{{@session_context_sidebar}}' 'cop
 bind-key -T copy-mode MouseDragEnd1Pane if-shell -F '#{{@session_context_sidebar}}' {{ send-keys -X copy-pipe-and-cancel "{command} copy-stdin" }} {{ send-keys -X copy-pipe-and-cancel "{command} copy-raw-stdin" }}
 bind-key -T copy-mode-vi MouseDragEnd1Pane if-shell -F '#{{@session_context_sidebar}}' {{ send-keys -X copy-pipe-and-cancel "{command} copy-stdin" }} {{ send-keys -X copy-pipe-and-cancel "{command} copy-raw-stdin" }}
 set -g set-titles on
-set -g set-titles-string '#S'
+set -g set-titles-string '#{{?#{{m:? *,#{{pane_title}}}},#{{s/ .*//:pane_title}} ,}}#S'
 set -g status-interval 5
 set -g status-left-length 90
 set -g status-left '#[bold]#S#[default] '
@@ -2263,13 +2263,15 @@ def title_for_client(terminal_tty: str) -> str:
 
 
 def watch_terminal_title(terminal_tty: str, terminal_fd: int, stop_event: threading.Event) -> None:
+    previous_title = ""
     while not stop_event.is_set():
         title = title_for_client(terminal_tty)
-        if title:
+        if title and title != previous_title:
             try:
                 os.write(terminal_fd, terminal_title_sequence(title))
             except OSError:
                 return
+            previous_title = title
         stop_event.wait(2)
 
 
