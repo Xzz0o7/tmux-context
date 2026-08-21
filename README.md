@@ -43,6 +43,8 @@ Claude Code closes its transcript between writes, so the session is matched by t
 - Clipboard writes run in the background, so the selection highlight remains responsive while copying.
 - Dragging text in a normal tmux pane copies it and returns to the original position, so historical output stays at its current location.
 - Terminal titles use the tmux session name, with Windows Terminal setup available as an explicit command.
+- Managed `codex resume` launches reconnect to an existing live tmux writer instead of starting a second writer for the same thread.
+- Managed sessions close when their launch command exits or their last tmux client leaves, without leaving a sidebar or login shell behind.
 - `Ctrl-b H` toggles the sidebar; `Ctrl-b R` refreshes the current session name.
 
 ## Install from WSL or Linux
@@ -67,6 +69,12 @@ Start an AI CLI from a regular shell so `tmux-context` can create the managed se
 ```
 
 If neither `codex` nor `claude` is the command you use, replace it with the actual executable and arguments. Running `tmux-context run` inside an existing tmux client deliberately does not create a nested tmux server.
+
+For a managed Codex launcher, `resume <thread-id>` attaches directly when that thread is already live. The normal Codex picker is preserved when no ID is supplied; if the selected thread has a live writer, `tmux-context` switches the client to its existing tmux session after Codex reports the conflict. Inactive saved sessions still use the native Codex resume path.
+
+A managed session follows the lifetime of its foreground entrypoint. It ends when the launched Codex or other command exits, or when the last tmux client detaches because of a normal detach, a closed terminal window, or a terminal crash. Closing one of several terminal windows attached to the same session leaves the remaining clients untouched; cleanup occurs only after the last one leaves. This behavior is restricted to sessions marked `@session_context_managed=1` by `tmux-context run`. Ordinary tmux sessions are unaffected, and the global `destroy-unattached` option remains off.
+
+Lifecycle cleanup ends tmux panes and their processes only. It does not invoke Codex `/delete` or remove transcripts under `$CODEX_HOME/sessions`; permanent conversation deletion remains an explicit user action in Codex.
 
 ## Install and use from PowerShell
 
@@ -112,6 +120,7 @@ This backs up `settings.json`, sets `suppressApplicationTitle: false` for WSL pr
 | `./tmux-context doctor` | Check tmux, entrypoint, generated config, and Windows Terminal discovery |
 | `./tmux-context run --name <name> -- <command>` | Create and attach a managed tmux session |
 | `./tmux-context client <session-id>` | Attach to an existing session with terminal-title monitoring |
+| `./tmux-context activate <thread-id>` | Attach or switch to the live tmux session that owns a Codex thread |
 | `./tmux-context enable-windows-title` | Configure Windows Terminal WSL title support |
 
 ## Tests

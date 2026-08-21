@@ -64,6 +64,22 @@ TITLE_COMMAND_PATTERN = re.compile(
     r"^(?:sudo\s+)?(?:tmux-context|cs|tmux|git|python3?|bash|sh|zsh|cd|ls|cat|grep|rg|find|fuser|adb|wsl|curl)\s+",
     re.IGNORECASE,
 )
+THREAD_ID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+THREAD_ID_PATTERN = re.compile(rf"^{THREAD_ID_TEXT}$", re.IGNORECASE)
+ACTIVE_WRITER_PATTERN = re.compile(
+    rf"\bthread\s+({THREAD_ID_TEXT})\s+already has an active writer\b",
+    re.IGNORECASE,
+)
+CODEX_LAUNCHERS = {
+    "codex",
+    "codex-default",
+    "codex-gw",
+    "codex-runner",
+    "codexa",
+    "codexapi",
+    "codexb",
+    "cgw",
+}
 
 
 def run_tmux(*args: str, capture: bool = True) -> subprocess.CompletedProcess[str]:
@@ -410,6 +426,93 @@ def agent_identity(pane_id: str) -> tuple[str, str, str]:
             if identity:
                 return identity
     return "", detected_home, ""
+
+
+def tmux_session_rows() -> list[dict[str, str]]:
+    result = run_tmux(
+        "list-sessions",
+        "-F",
+        "#{session_id}\t#{session_name}\t#{@session_context_thread_id}\t"
+        "#{@session_context_raw_path}\t#{@session_context_source_pane}\t#{session_attached}",
+    )
+    rows = []
+    if result.returncode != 0:
+        return rows
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 5)
+        if len(fields) != 6:
+            continue
+        rows.append(
+            {
+                "session_id": fields[0],
+                "session_name": fields[1],
+                "thread_id": fields[2],
+                "raw_path": fields[3],
+                "source_pane": fields[4],
+                "attached": fields[5],
+            }
+        )
+    return rows
+
+
+def live_codex_session(row: dict[str, str]) -> dict[str, str] | None:
+    source_pane = resolve_source_pane(row["session_id"], row.get("source_pane", ""))
+    if not source_pane:
+        return None
+    thread_id, _, raw_path = agent_identity(source_pane)
+    path = Path(raw_path) if raw_path else None
+    if (
+        not thread_id
+        or not path
+        or path.suffix != ".jsonl"
+        or "sessions" not in path.parts
+        or not path.name.startswith("rollout-")
+    ):
+        return None
+    live = dict(row)
+    live.update({"thread_id": thread_id, "raw_path": raw_path, "source_pane": source_pane})
+    return live
+
+
+def active_codex_session(reference: str) -> dict[str, str] | None:
+    normalized = reference.strip()
+    rows = tmux_session_rows()
+    candidates = [
+        row
+        for row in rows
+        if normalized in (row["session_id"], row["session_name"], row["thread_id"])
+    ]
+    if not candidates and THREAD_ID_PATTERN.fullmatch(normalized):
+        candidates = rows
+    for row in candidates:
+        live = live_codex_session(row)
+        if live and normalized in (live["session_id"], live["session_name"], live["thread_id"]):
+            return live
+    return None
+
+
+def active_writer_thread_id(text: str) -> str:
+    matches = ACTIVE_WRITER_PATTERN.findall(text)
+    return matches[-1].lower() if matches else ""
+
+
+def codex_resume_verb_index(command: list[str]) -> int:
+    if not command or Path(command[0]).name.lower() not in CODEX_LAUNCHERS:
+        return -1
+    verb_index = 2 if Path(command[0]).name.lower() == "codex-runner" else 1
+    return verb_index if len(command) > verb_index and command[verb_index] == "resume" else -1
+
+
+def is_codex_resume_command(command: list[str]) -> bool:
+    return codex_resume_verb_index(command) >= 0
+
+
+def resume_thread_reference(command: list[str]) -> str:
+    verb_index = codex_resume_verb_index(command)
+    if verb_index < 0 or len(command) <= verb_index + 1:
+        return ""
+    candidate = command[verb_index + 1]
+    return candidate.lower() if THREAD_ID_PATTERN.fullmatch(candidate) else ""
 
 
 def shorten_title_path(match: re.Match[str]) -> str:
@@ -2084,6 +2187,7 @@ set -g status-right '#[fg=colour244]%Y-%m-%d %H:%M'
 
 set-hook -g after-new-session 'run-shell -b "{command} setup #{{q:session_id}} #{{q:pane_id}}"'
 set-hook -g client-attached 'run-shell -b "{command} setup #{{q:session_id}} #{{q:pane_id}}"'
+set-hook -g client-detached 'run-shell -b "{command} close-detached #{{q:session_id}}"'
 set-hook -g client-session-changed 'run-shell -b "{command} rename #{{q:session_id}} #{{q:pane_id}}"'
 set-hook -g after-select-pane 'run-shell -b "{command} rename #{{q:session_id}} #{{q:pane_id}}"'
 
@@ -2110,6 +2214,36 @@ def backup_file(path: Path, label: str) -> Path | None:
     return backup_path
 
 
+#add by xzhe on 20260821 start : migrate existing tmux-context sessions safely
+def mark_existing_managed_sessions() -> int:
+    result = run_tmux(
+        "list-sessions",
+        "-F",
+        "#{session_id}\t#{@session_context_launch_name}\t#{@session_context_managed}",
+    )
+    if result.returncode != 0:
+        return 0
+
+    marked = 0
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) != 3 or not fields[1] or fields[2] == "1":
+            continue
+        updated = run_tmux(
+            "set-option",
+            "-q",
+            "-t",
+            fields[0],
+            "@session_context_managed",
+            "1",
+            capture=False,
+        )
+        if updated.returncode == 0:
+            marked += 1
+    return marked
+#add by xzhe on 20260821 end
+
+
 def install_tmux_integration() -> int:
     TMUX_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     write_text_atomic(TMUX_CONFIG_PATH, generated_tmux_config())
@@ -2126,8 +2260,11 @@ def install_tmux_integration() -> int:
         write_text_atomic(USER_TMUX_CONFIG_PATH, updated)
 
     source_result = run_tmux("source-file", str(TMUX_CONFIG_PATH))
+    marked_sessions = mark_existing_managed_sessions() if source_result.returncode == 0 else 0
     print(f"Installed tmux integration: {TMUX_CONFIG_PATH}")
     print(f"Managed tmux entry: {USER_TMUX_CONFIG_PATH}")
+    if marked_sessions:
+        print(f"Marked existing tmux-context sessions as managed: {marked_sessions}")
     if backup_path:
         print(f"Backup: {backup_path}")
     if source_result.returncode != 0:
@@ -2301,18 +2438,168 @@ def attach_with_terminal_title(session_id: str) -> int:
         os.close(terminal_fd)
 
 
+def clients_for_session(session_id: str) -> list[dict[str, str]]:
+    result = run_tmux(
+        "list-clients",
+        "-F",
+        "#{session_id}\t#{client_tty}\t#{client_activity}",
+    )
+    clients = []
+    if result.returncode != 0:
+        return clients
+    for line in result.stdout.splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) == 3 and fields[0] == session_id and fields[1]:
+            clients.append(
+                {
+                    "session_id": fields[0],
+                    "tty": fields[1],
+                    "activity": fields[2],
+                }
+            )
+    return clients
+
+
+#add by xzhe on 20260821 start : bind managed sessions to their client and agent lifetime
+def close_managed_session(session_id: str, require_unattached: bool) -> int:
+    if not session_id or tmux_value(session_id, "#{@session_context_managed}") != "1":
+        return 0
+    if require_unattached and clients_for_session(session_id):
+        return 0
+
+    managed = "#{==:#{@session_context_managed},1}"
+    condition = (
+        f"#{{&&:{managed},#{{==:#{{session_attached}},0}}}}"
+        if require_unattached
+        else managed
+    )
+    result = run_tmux(
+        "if-shell",
+        "-F",
+        "-t",
+        session_id,
+        condition,
+        f"kill-session -t {shlex.quote(session_id)}",
+        capture=False,
+    )
+    return 0 if result.returncode == 0 else 1
+
+
+def close_detached_session(session_id: str) -> int:
+    return close_managed_session(session_id, require_unattached=True)
+
+
+def close_agent_session(session_id: str) -> int:
+    return close_managed_session(session_id, require_unattached=False)
+
+
+#add by xzhe on 20260821 end
+
+
+def activate_codex_session(reference: str, cleanup_current: bool = False) -> int:
+    target = active_codex_session(reference)
+    if not target:
+        return 3
+
+    if not os.environ.get("TMUX"):
+        return attach_with_terminal_title(target["session_id"])
+
+    current_pane = os.environ.get("TMUX_PANE", "")
+    current_session = tmux_value(current_pane, "#{session_id}") if current_pane else ""
+    if not current_session:
+        print("Unable to identify the current tmux session.", file=sys.stderr)
+        return 1
+    if current_session == target["session_id"]:
+        return 0
+
+    clients = clients_for_session(current_session)
+    if not clients:
+        print("No tmux client is attached to the current session.", file=sys.stderr)
+        return 1
+    client = max(clients, key=lambda item: int(item["activity"] or "0"))
+    switched = run_tmux(
+        "switch-client",
+        "-c",
+        client["tty"],
+        "-t",
+        target["session_id"],
+    )
+    if switched.returncode != 0:
+        print(f"Failed to switch to active Codex session {target['session_id']}.", file=sys.stderr)
+        return 1
+    if target.get("source_pane"):
+        run_tmux("select-pane", "-t", target["source_pane"], capture=False)
+
+    transient = os.environ.get("TMUX_CONTEXT_RESUME_LAUNCHER") == "1"
+    if cleanup_current and transient:
+        run_tmux("kill-session", "-t", current_session, capture=False)
+    return 0
+
+
+def recover_active_writer(pane_id: str = "") -> int:
+    pane_id = pane_id or os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        return 3
+    captured = run_tmux("capture-pane", "-p", "-J", "-t", pane_id, "-S", "-24")
+    if captured.returncode != 0:
+        return 3
+    thread_id = active_writer_thread_id(captured.stdout)
+    if not thread_id:
+        return 3
+    result = activate_codex_session(thread_id, cleanup_current=True)
+    if result == 3:
+        print(
+            f"Active writer {thread_id} has no live tmux session mapping.",
+            file=sys.stderr,
+        )
+    return result
+
+
+#add by xzhe on 20260821 start : close the managed session when its launch command exits
+def tmux_launch_command(command: list[str]) -> str:
+    launch = shlex.join(command)
+    mark_managed = 'tmux set-option -q -t "$TMUX_PANE" @session_context_managed 1'
+    cleanup = shlex.quote(f"{ENTRYPOINT} close-agent-exit #{{q:session_id}}")
+    close_session = f'tmux run-shell -b -t "$TMUX_PANE" {cleanup}'
+    if not is_codex_resume_command(command):
+        return f'{mark_managed}; {launch}; status=$?; {close_session}; exit "$status"'
+    recovery = shlex.quote(str(ENTRYPOINT))
+    return (
+        f"{mark_managed}; export TMUX_CONTEXT_RESUME_LAUNCHER=1; "
+        f"{launch}; status=$?; "
+        f'if [ "$status" -ne 0 ] && {recovery} recover-active-writer --pane "$TMUX_PANE"; '
+        f'then status=0; fi; {close_session}; exit "$status"'
+    )
+#add by xzhe on 20260821 end
+
+
 def run_command_in_tmux(name: str, cwd: str, command: list[str]) -> int:
     if not command:
         print("tmux-context run requires a command after --", file=sys.stderr)
         return 2
-    if os.environ.get("TMUX") or not sys.stdin.isatty() or not sys.stdout.isatty():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        os.execvpe(command[0], command, os.environ.copy())
+
+    resume_reference = resume_thread_reference(command)
+    if resume_reference:
+        activated = activate_codex_session(resume_reference)
+        if activated == 0:
+            return 0
+        if activated != 3:
+            return activated
+
+    if os.environ.get("TMUX"):
+        if is_codex_resume_command(command):
+            status = subprocess.call(command)
+            if status and recover_active_writer() == 0:
+                return 0
+            return status
         os.execvpe(command[0], command, os.environ.copy())
 
     project = re.sub(r"[^\w-]+", "-", Path(cwd).name, flags=re.UNICODE).strip("-") or "wsl"
     prefix = re.sub(r"[^\w-]+", "-", name, flags=re.UNICODE).strip("-") or "cs"
     session_name = f"{prefix}-{project}-{datetime.now().strftime('%H%M%S')}-{os.getpid()}"
-    login_shell = os.environ.get("SHELL", "/bin/bash")
-    launch_command = f"{shlex.join(command)}; exec {shlex.quote(login_shell)} -l"
+    launch_command = tmux_launch_command(command)
     if run_tmux("has-session").returncode == 0:
         run_tmux("source-file", str(TMUX_CONFIG_PATH), capture=False)
     result = run_tmux(
@@ -2331,6 +2618,17 @@ def run_command_in_tmux(name: str, cwd: str, command: list[str]) -> int:
     if result.returncode != 0 or not session_id:
         print("Failed to create tmux session.", file=sys.stderr)
         return 1
+    #add by xzhe on 20260821 start : mark only tmux-context run sessions as managed
+    run_tmux(
+        "set-option",
+        "-q",
+        "-t",
+        session_id,
+        "@session_context_managed",
+        "1",
+        capture=False,
+    )
+    #add by xzhe on 20260821 end
     run_tmux(
         "set-option",
         "-q",
@@ -2340,6 +2638,16 @@ def run_command_in_tmux(name: str, cwd: str, command: list[str]) -> int:
         prefix,
         capture=False,
     )
+    if is_codex_resume_command(command):
+        run_tmux(
+            "set-option",
+            "-q",
+            "-t",
+            session_id,
+            "@session_context_resume_launcher",
+            "1",
+            capture=False,
+        )
     return attach_with_terminal_title(session_id)
 
 
@@ -2389,6 +2697,19 @@ def main(argv: list[str] | None = None) -> int:
     client_parser = subparsers.add_parser("client")
     client_parser.add_argument("session_id")
 
+    activate_parser = subparsers.add_parser("activate")
+    activate_parser.add_argument("session")
+    activate_parser.add_argument("--cleanup-current", action="store_true")
+
+    recover_parser = subparsers.add_parser("recover-active-writer")
+    recover_parser.add_argument("--pane", default="")
+
+    close_detached_parser = subparsers.add_parser("close-detached")
+    close_detached_parser.add_argument("session_id")
+
+    close_agent_parser = subparsers.add_parser("close-agent-exit")
+    close_agent_parser.add_argument("session_id")
+
     args = parser.parse_args(argv)
     if args.command == "rename":
         rename_session(args.session_id, args.pane_id)
@@ -2422,6 +2743,14 @@ def main(argv: list[str] | None = None) -> int:
         return run_command_in_tmux(args.name, args.cwd, launch_command)
     elif args.command == "client":
         return attach_with_terminal_title(args.session_id)
+    elif args.command == "activate":
+        return activate_codex_session(args.session, cleanup_current=args.cleanup_current)
+    elif args.command == "recover-active-writer":
+        return recover_active_writer(args.pane)
+    elif args.command == "close-detached":
+        return close_detached_session(args.session_id)
+    elif args.command == "close-agent-exit":
+        return close_agent_session(args.session_id)
     return 0
 
 

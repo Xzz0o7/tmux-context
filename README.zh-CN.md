@@ -43,6 +43,8 @@ Claude Code 每次写入后都会关闭会话文件，因此改用记录中的 `
 - 剪贴板写入在后台执行，复制时的选中高亮保持及时响应。
 - 在普通 tmux pane 中拖动文本会自动复制并回到原来的显示位置，因此历史输出不会跳动。
 - 终端标签使用 tmux 会话名；可通过显式命令配置 Windows Terminal。
+- 受管理的 `codex resume` 若命中已有 live writer，会直接回到原 tmux 会话，不再为同一 thread 启动第二个 writer。
+- 受管理会话在启动命令退出或最后一个 tmux client 离开时自动关闭，不遗留侧边栏或登录 shell。
 - `Ctrl-b H` 切换侧边栏，`Ctrl-b R` 刷新当前会话名称。
 
 ## 从 WSL 或 Linux 安装
@@ -67,6 +69,12 @@ chmod +x tmux-context install.sh
 ```
 
 如果你实际使用的命令既不是 `codex` 也不是 `claude`，请替换成对应的可执行文件及参数。在已有 tmux client 内执行 `tmux-context run` 时，程序不会再嵌套创建 tmux server。
+
+对于受管理的 Codex 入口，`resume <thread-id>` 会在目标 thread 已运行时直接连接原会话。未指定 ID 时仍保留 Codex 原生 picker；若选中的 thread 已有 live writer，Codex 报告冲突后，`tmux-context` 会自动把 client 切换到对应的既有 tmux 会话。未运行的历史会话仍走 Codex 原生恢复路径。
+
+受管理会话的生命周期与前台入口绑定：启动的 Codex 或其他命令退出时，会话立即结束；最后一个 tmux client 正常 detach、终端窗口关闭或终端崩溃时，也会结束该会话及其中的后台进程。多个终端窗口连接同一会话时，关闭其中一个不会影响其余 client，只有最后一个离开才会清理。该规则只识别 `tmux-context run` 设置的 `@session_context_managed=1`，普通 tmux 会话不受影响，全局 `destroy-unattached` 仍保持关闭。
+
+生命周期清理只结束 tmux panes 和其中的进程，不调用 Codex `/delete`，也不删除 `$CODEX_HOME/sessions` 中的 transcript；需要永久删除对话时仍应由用户在 Codex 中显式执行。
 
 ## 从 PowerShell 安装和使用
 
@@ -112,6 +120,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 | `./tmux-context doctor` | 检查 tmux、入口脚本、生成配置和 Windows Terminal 发现状态 |
 | `./tmux-context run --name <name> -- <command>` | 创建并连接受管理的 tmux 会话 |
 | `./tmux-context client <session-id>` | 连接已有会话并启用终端标题监听 |
+| `./tmux-context activate <thread-id>` | 连接或切换到持有该 Codex thread 的 live tmux 会话 |
 | `./tmux-context enable-windows-title` | 配置 Windows Terminal 的 WSL 标签标题支持 |
 
 ## 测试

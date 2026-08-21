@@ -12,10 +12,14 @@ if str(PROJECT_ROOT) not in os.sys.path:
 
 import tmux_context
 from tmux_context import (
+    active_codex_session,
+    active_writer_thread_id,
     claude_project_slug,
     claude_session_path,
     claude_transcript_messages,
     clean_sidebar_selection_text,
+    close_agent_session,
+    close_detached_session,
     completed_context_title,
     is_claude_process,
     is_claude_transcript,
@@ -29,12 +33,16 @@ from tmux_context import (
     indexed_ai_title,
     indexed_title,
     managed_source_block,
+    mark_existing_managed_sessions,
     meaningful_title,
+    recover_active_writer,
+    resume_thread_reference,
     run_command_in_tmux,
     session_base_name,
     source_name_from_raw_path,
     strip_managed_block,
     terminal_title_sequence,
+    tmux_launch_command,
     title_for_client,
     transcript_header_field_ranges,
     transcript_time,
@@ -63,6 +71,7 @@ class TmuxContextTest(unittest.TestCase):
 
         self.assertIn('/opt/tmux-context/tmux-context setup', config)
         self.assertIn('/opt/tmux-context/tmux-context rename', config)
+        self.assertIn('/opt/tmux-context/tmux-context close-detached #{q:session_id}', config)
         self.assertIn('"/opt/tmux-context/tmux-context" rename', config)
         self.assertNotIn("sync-title", config)
         self.assertIn('"/opt/tmux-context/tmux-context" toggle', config)
@@ -82,6 +91,124 @@ class TmuxContextTest(unittest.TestCase):
         sequence = terminal_title_sequence("project\ncontext\x00")
 
         self.assertEqual(sequence, b"\x1b]0;project context\x07\x1b]2;project context\x07")
+
+    def test_active_writer_thread_id_uses_last_complete_error(self):
+        first = "01a01a19-51a8-75b3-9ec8-01196347e26a"
+        second = "01a01e43-0377-74d1-aca3-966177f904bb"
+        output = (
+            f"thread {first} already has an active writer (code -32600)\n"
+            f"thread {second} already has an active writer (code -32600)"
+        )
+
+        self.assertEqual(active_writer_thread_id(output), second)
+
+    def test_resume_thread_reference_accepts_direct_uuid_only(self):
+        thread_id = "01a01a19-51a8-75b3-9ec8-01196347e26a"
+
+        self.assertEqual(resume_thread_reference(["/opt/cgw", "resume", thread_id]), thread_id)
+        self.assertEqual(
+            resume_thread_reference(["/opt/codex-runner", "a", "resume", thread_id]),
+            thread_id,
+        )
+        self.assertEqual(resume_thread_reference(["/opt/cgw", "resume", "--last"]), "")
+        self.assertEqual(resume_thread_reference(["/opt/tool", "resume", thread_id]), "")
+
+    def test_active_codex_session_requires_live_identity_match(self):
+        thread_id = "01a01a19-51a8-75b3-9ec8-01196347e26a"
+        row = {
+            "session_id": "$39",
+            "session_name": "carrier-config--cgw-user",
+            "thread_id": thread_id,
+            "raw_path": "/home/user/.codex/sessions/rollout.jsonl",
+            "source_pane": "%78",
+            "attached": "0",
+        }
+        with mock.patch("tmux_context.tmux_session_rows", return_value=[row]), \
+                mock.patch("tmux_context.live_codex_session", return_value=dict(row)):
+            result = active_codex_session(thread_id)
+
+        self.assertEqual(result["session_id"], "$39")
+
+    def test_recover_active_writer_activates_mapped_thread(self):
+        thread_id = "01a01a19-51a8-75b3-9ec8-01196347e26a"
+        captured = mock.Mock(
+            returncode=0,
+            stdout=f"thread {thread_id} already has an active writer (code -32600)\n",
+        )
+        with mock.patch("tmux_context.run_tmux", return_value=captured), \
+                mock.patch("tmux_context.activate_codex_session", return_value=0) as activate:
+            result = recover_active_writer("%90")
+
+        self.assertEqual(result, 0)
+        activate.assert_called_once_with(thread_id, cleanup_current=True)
+
+    def test_tmux_launch_command_recovers_resume_error(self):
+        command = tmux_launch_command(["/opt/cgw", "resume", "--all"])
+        runner_command = tmux_launch_command(
+            ["/opt/codex-runner", "a", "resume", "--all"],
+        )
+
+        self.assertIn("TMUX_CONTEXT_RESUME_LAUNCHER=1", command)
+        self.assertIn("recover-active-writer", command)
+        self.assertIn("recover-active-writer", runner_command)
+        self.assertIn('"$TMUX_PANE"', command)
+        self.assertIn("close-agent-exit", command)
+        self.assertIn('exit "$status"', command)
+        self.assertNotIn("exec /bin/bash -l", command)
+
+    def test_tmux_launch_command_closes_instead_of_starting_login_shell(self):
+        command = tmux_launch_command(["/opt/codex"])
+
+        self.assertTrue(command.startswith('tmux set-option -q -t "$TMUX_PANE"'))
+        self.assertIn("@session_context_managed 1", command)
+        self.assertIn("close-agent-exit", command)
+        self.assertIn("#{q:session_id}", command)
+        self.assertNotIn("exec /bin/bash -l", command)
+
+    def test_close_detached_ignores_unmanaged_session(self):
+        with mock.patch("tmux_context.tmux_value", return_value=""), \
+                mock.patch("tmux_context.clients_for_session") as clients, \
+                mock.patch("tmux_context.run_tmux") as run_tmux:
+            result = close_detached_session("$9")
+
+        self.assertEqual(result, 0)
+        clients.assert_not_called()
+        run_tmux.assert_not_called()
+
+    def test_close_detached_keeps_session_with_another_client(self):
+        attached = [{"session_id": "$9", "tty": "/dev/pts/9", "activity": "1"}]
+        with mock.patch("tmux_context.tmux_value", return_value="1"), \
+                mock.patch("tmux_context.clients_for_session", return_value=attached), \
+                mock.patch("tmux_context.run_tmux") as run_tmux:
+            result = close_detached_session("$9")
+
+        self.assertEqual(result, 0)
+        run_tmux.assert_not_called()
+
+    def test_close_detached_kills_last_client_session(self):
+        completed = mock.Mock(returncode=0, stdout="")
+        with mock.patch("tmux_context.tmux_value", return_value="1"), \
+                mock.patch("tmux_context.clients_for_session", return_value=[]), \
+                mock.patch("tmux_context.run_tmux", return_value=completed) as run_tmux:
+            result = close_detached_session("$9")
+
+        self.assertEqual(result, 0)
+        call = run_tmux.call_args
+        self.assertEqual(call.args[:4], ("if-shell", "-F", "-t", "$9"))
+        self.assertIn("session_attached", call.args[4])
+        self.assertIn("kill-session -t '$9'", call.args[5])
+
+    def test_close_agent_kills_managed_session_even_with_client(self):
+        completed = mock.Mock(returncode=0, stdout="")
+        with mock.patch("tmux_context.tmux_value", return_value="1"), \
+                mock.patch("tmux_context.clients_for_session") as clients, \
+                mock.patch("tmux_context.run_tmux", return_value=completed) as run_tmux:
+            result = close_agent_session("$9")
+
+        self.assertEqual(result, 0)
+        clients.assert_not_called()
+        self.assertNotIn("session_attached", run_tmux.call_args.args[4])
+        self.assertIn("kill-session -t '$9'", run_tmux.call_args.args[5])
 
     def test_transcript_time_includes_date_and_time(self):
         timestamp = datetime.now().astimezone()
@@ -474,24 +601,66 @@ class TmuxContextTest(unittest.TestCase):
             self.assertNotIn(tmux_context.CS_MANAGER_BLOCK_START, installed)
             self.assertIn(tmux_context.MANAGED_BLOCK_START, installed)
 
+    def test_existing_tmux_context_sessions_receive_managed_marker(self):
+        responses = [
+            mock.Mock(
+                returncode=0,
+                stdout="$8\t\t\n$9\tcodexa\t\n$10\tcgw\t1\n",
+            ),
+            mock.Mock(returncode=0, stdout=""),
+        ]
+        with mock.patch("tmux_context.run_tmux", side_effect=responses) as run_tmux:
+            marked = mark_existing_managed_sessions()
+
+        self.assertEqual(marked, 1)
+        self.assertEqual(run_tmux.call_count, 2)
+        self.assertEqual(
+            run_tmux.call_args_list[1].args[-2:],
+            ("@session_context_managed", "1"),
+        )
+
     def test_run_command_creates_detached_session_then_attaches(self):
+        thread_id = "01a01a19-51a8-75b3-9ec8-01196347e26a"
         responses = [
             mock.Mock(returncode=1, stdout=""),
             mock.Mock(returncode=0, stdout="$9\n"),
+            mock.Mock(returncode=0, stdout=""),
+            mock.Mock(returncode=0, stdout=""),
             mock.Mock(returncode=0, stdout=""),
         ]
         with mock.patch.dict(os.environ, {"TMUX": ""}), \
                 mock.patch.object(tmux_context.sys.stdin, "isatty", return_value=True), \
                 mock.patch.object(tmux_context.sys.stdout, "isatty", return_value=True), \
+                mock.patch("tmux_context.activate_codex_session", return_value=3) as activate, \
                 mock.patch("tmux_context.run_tmux", side_effect=responses) as run_tmux, \
                 mock.patch("tmux_context.attach_with_terminal_title", return_value=0) as attach:
-            result = run_command_in_tmux("codexa", "/tmp", ["codexa", "resume", "session-id"])
+            result = run_command_in_tmux("codexa", "/tmp", ["codexa", "resume", thread_id])
 
         self.assertEqual(result, 0)
+        activate.assert_called_once_with(thread_id)
         self.assertEqual(run_tmux.call_args_list[1].args[0], "new-session")
-        self.assertIn("codexa resume session-id", run_tmux.call_args_list[1].args[-1])
-        self.assertEqual(run_tmux.call_args_list[2].args[-1], "codexa")
+        self.assertIn(f"codexa resume {thread_id}", run_tmux.call_args_list[1].args[-1])
+        self.assertIn("recover-active-writer", run_tmux.call_args_list[1].args[-1])
+        self.assertEqual(
+            run_tmux.call_args_list[2].args[-2:],
+            ("@session_context_managed", "1"),
+        )
+        self.assertEqual(run_tmux.call_args_list[3].args[-1], "codexa")
+        self.assertEqual(run_tmux.call_args_list[4].args[-1], "1")
         attach.assert_called_once_with("$9")
+
+    def test_run_command_activates_direct_live_resume_without_new_session(self):
+        thread_id = "01a01a19-51a8-75b3-9ec8-01196347e26a"
+        with mock.patch.dict(os.environ, {"TMUX": ""}), \
+                mock.patch.object(tmux_context.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(tmux_context.sys.stdout, "isatty", return_value=True), \
+                mock.patch("tmux_context.activate_codex_session", return_value=0) as activate, \
+                mock.patch("tmux_context.run_tmux") as run_tmux:
+            result = run_command_in_tmux("cgw", "/tmp", ["/opt/cgw", "resume", thread_id])
+
+        self.assertEqual(result, 0)
+        activate.assert_called_once_with(thread_id)
+        run_tmux.assert_not_called()
 
 
 class ClaudeTranscriptTest(unittest.TestCase):
