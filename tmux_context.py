@@ -39,6 +39,13 @@ CLAUDE_SCAN_FILE_LIMIT = 40
 CLAUDE_SCAN_DIR_LIMIT = 12
 CLAUDE_START_WINDOW_SECONDS = 300
 CLAUDE_META_CACHE: dict[str, tuple[int, int, str, str, float]] = {}
+CODEX_INTERNAL_PROMPT_PREFIXES = (
+    "# AGENTS.md instructions for ",
+    "<environment_context>",
+    "<subagent_notification>",
+    "<send_user_message_question_reply",
+    "The following is the Codex agent",
+)
 TITLE_TASK_HINTS = (
     "怎么", "如何", "为什么", "是否", "能否", "查看", "检查", "分析", "修复",
     "实现", "添加", "修改", "删除", "优化", "配置", "适配", "迁移", "打包",
@@ -222,23 +229,8 @@ def file_mtime(path: Path) -> float:
         return 0.0
 
 
-def open_codex_session_path(process_id: int) -> Path | None:
-    fd_dir = Path(f"/proc/{process_id}/fd")
-    try:
-        entries = list(fd_dir.iterdir())
-    except OSError:
-        return None
-    for entry in entries:
-        try:
-            target = Path(os.readlink(entry))
-        except OSError:
-            continue
-        if target.suffix == ".jsonl" and "sessions" in target.parts and target.name.startswith("rollout-"):
-            return target
-    return None
-
-
-def session_id_from_path(session_path: Path) -> str:
+# add by xzhe on 20260930 start : Distinguish main Codex transcripts from subagents.
+def codex_session_meta(session_path: Path) -> dict:
     try:
         with session_path.open() as stream:
             for _ in range(40):
@@ -250,11 +242,40 @@ def session_id_from_path(session_path: Path) -> str:
                 except json.JSONDecodeError:
                     continue
                 if entry.get("type") == "session_meta":
-                    session_id = (entry.get("payload") or {}).get("id")
-                    if session_id:
-                        return str(session_id)
+                    return entry.get("payload") or {}
     except OSError:
         pass
+    return {}
+
+
+def is_codex_subagent_session(session_path: Path) -> bool:
+    source = codex_session_meta(session_path).get("source")
+    return isinstance(source, dict) and "subagent" in source
+
+
+def open_codex_session_path(process_id: int) -> Path | None:
+    fd_dir = Path(f"/proc/{process_id}/fd")
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    candidates = []
+    for entry in entries:
+        try:
+            target = Path(os.readlink(entry))
+        except OSError:
+            continue
+        if target.suffix == ".jsonl" and "sessions" in target.parts and target.name.startswith("rollout-"):
+            if not is_codex_subagent_session(target):
+                candidates.append(target)
+    return max(candidates, key=file_mtime, default=None)
+# add by xzhe on 20260930 end
+
+
+def session_id_from_path(session_path: Path) -> str:
+    session_id = codex_session_meta(session_path).get("id")
+    if session_id:
+        return str(session_id)
     match = re.search(
         r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
         session_path.name,
@@ -392,6 +413,10 @@ def codex_process_identity(process_id: int, detected_home: str) -> tuple[tuple[s
     if thread_id:
         codex_home = detected_home or str(Path.home() / ".codex")
         session_path = find_session_path(codex_home, thread_id)
+        # add by xzhe on 20260930 start : Ignore inherited subagent thread IDs.
+        if session_path and is_codex_subagent_session(session_path):
+            return None, detected_home
+        # add by xzhe on 20260930 end
         return (thread_id, codex_home, str(session_path or "")), detected_home
     return None, detected_home
 
@@ -533,6 +558,10 @@ def title_candidate(text: str) -> str:
 
 
 def meaningful_title(text: str, limit: int = 34) -> str:
+    # add by xzhe on 20260930 start : Reject cached Codex internal prompt titles.
+    if text.strip().startswith(CODEX_INTERNAL_PROMPT_PREFIXES):
+        return ""
+    # add by xzhe on 20260930 end
     compact = title_candidate(text)
     normalized = compact.lower().strip(" .,!?:;，。！？：；")
     if not normalized or normalized in WEAK_TITLE_MESSAGES:
@@ -592,7 +621,10 @@ def completed_context_title(raw_path: str) -> str:
     pending_user_messages: list[str] = []
     for message in transcript_messages(lines, raw_path):
         if message["role"] == "user":
-            pending_user_messages.append(message["text"])
+            # add by xzhe on 20260930 start : Keep clarification replies out of task titles.
+            if message.get("phase") != "question_reply":
+                pending_user_messages.append(message["text"])
+            # add by xzhe on 20260930 end
         elif is_final_reply(message) and pending_user_messages:
             completed_messages.extend(pending_user_messages)
             pending_user_messages.clear()
@@ -805,7 +837,13 @@ def rename_session(session_id: str, pane_id: str = "") -> None:
     raw_path = raw_path or tmux_value(session_id, "#{@session_context_raw_path}")
     if not live_title:
         live_title = context_title(thread_id, raw_path)
-    stored_title = meaningful_title(tmux_value(session_id, "#{@session_context_title}"))
+    # add by xzhe on 20260930 start : Clear titles previously derived from internal prompts.
+    stored_text = tmux_value(session_id, "#{@session_context_title}")
+    invalid_stored_title = stored_text.strip().startswith(CODEX_INTERNAL_PROMPT_PREFIXES)
+    stored_title = meaningful_title(stored_text)
+    if invalid_stored_title:
+        run_tmux("set-option", "-q", "-t", session_id, "@session_context_title", "", capture=False)
+    # add by xzhe on 20260930 end
     title = live_title or stored_title
     current_name = tmux_value(session_id, "#{session_name}")
     run_tmux("set-option", "-q", "-t", session_id, "@session_context_source_pane", source_pane, capture=False)
@@ -813,7 +851,7 @@ def rename_session(session_id: str, pane_id: str = "") -> None:
         run_tmux("set-option", "-q", "-t", session_id, "@session_context_thread_id", thread_id, capture=False)
     if raw_path:
         run_tmux("set-option", "-q", "-t", session_id, "@session_context_raw_path", raw_path, capture=False)
-    if not title:
+    if not title and not invalid_stored_title:
         if current_name:
             update_terminal_title(session_id, current_name)
         return
@@ -1367,12 +1405,33 @@ def codex_transcript_messages(lines: Iterable[str]) -> list[dict]:
         text = "\n".join(chunks).strip()
         if not text:
             continue
-        if role == "user" and text.startswith("# AGENTS.md instructions for ") and "<environment_context>" in text:
-            continue
+        # add by xzhe on 20260930 start : Normalize user replies and omit injected notifications.
+        phase = payload.get("phase") or ""
+        if role == "user":
+            if text.startswith("<send_user_message_question_reply>"):
+                phase = "question_reply"
+                body = text.removeprefix("<send_user_message_question_reply>").removesuffix(
+                    "</send_user_message_question_reply>"
+                ).strip()
+                try:
+                    replies = json.loads(body)
+                except json.JSONDecodeError:
+                    replies = []
+                if isinstance(replies, list):
+                    answers = [
+                        f"{reply.get('question') or ''}\n{reply['answer']}".strip()
+                        for reply in replies
+                        if isinstance(reply, dict) and isinstance(reply.get("answer"), str)
+                    ]
+                    if answers:
+                        text = "\n\n".join(answers)
+            elif text.startswith(CODEX_INTERNAL_PROMPT_PREFIXES):
+                continue
+        # add by xzhe on 20260930 end
         messages.append(
             {
                 "role": role,
-                "phase": payload.get("phase") or "",
+                "phase": phase,
                 "text": clip_transcript_text(text),
                 "timestamp": entry.get("timestamp") or "",
             }

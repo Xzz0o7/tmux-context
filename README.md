@@ -32,10 +32,13 @@ PowerShell compatibility means that you can install, launch, diagnose, and attac
 
 Claude Code closes its transcript between writes, so the session is matched by the recorded `cwd` and the closest transcript start time. Concurrent Claude sessions in the same directory therefore stay on their own sidebar.
 
+Codex detection excludes transcripts marked as subagents in `session_meta.source`, including guardian approval reviews. If a process keeps multiple main transcripts open after a fork, the most recently updated main transcript is selected.
+
 ## Features
 
 - Session titles prioritize the most recent meaningful task whose Codex or Claude Code response has completed.
 - Weak text such as `继续`, raw shell commands, and image placeholders does not rename a session.
+- Injected Codex instructions and subagent notifications are omitted from the conversation. Asynchronous question replies show the question and answer without internal metadata and do not replace the task title.
 - The current-session sidebar supports mouse selection, collapsing one prompt at a time, expanding AI replies, scrolling, filtering, and hiding/showing reasoning output.
 - Claude Code thinking blocks and interim answers between tool calls are treated as reasoning output, so only the closing answer of a turn is shown in the final-answer view.
 - Click a conversation once to expand or collapse it. Drag text in an expanded conversation to copy only the selected body text; headers, timestamps, and separators are excluded.

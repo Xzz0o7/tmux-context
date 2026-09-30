@@ -52,6 +52,171 @@ from tmux_context import (
 )
 
 
+class CodexSessionIdentityTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="tmux-context-test-")
+        self.addCleanup(directory.cleanup)
+        self.sessions = Path(directory.name) / ".codex" / "sessions"
+        self.sessions.mkdir(parents=True)
+
+    def write_session(self, session_id, source):
+        path = self.sessions / f"rollout-{session_id}.jsonl"
+        metadata = {"id": session_id}
+        if source is not None:
+            metadata["source"] = source
+        path.write_text(json.dumps({"type": "session_meta", "payload": metadata}) + "\n")
+        return path
+
+    def open_session(self, paths):
+        entries = [Path(f"/proc/12345/fd/{index}") for index in range(len(paths))]
+        targets = dict(zip(entries, map(str, paths)))
+        with mock.patch.object(Path, "iterdir", return_value=entries), \
+                mock.patch("tmux_context.os.readlink", side_effect=targets.__getitem__):
+            return tmux_context.open_codex_session_path(12345)
+
+    def test_open_session_skips_guardian_and_spawned_agents(self):
+        main = self.write_session("main", "cli")
+        os.utime(main, (1, 1))
+        for source in (
+            {"subagent": {"other": "guardian"}},
+            {"subagent": {"thread_spawn": {"parent_thread_id": "main", "depth": 1}}},
+        ):
+            with self.subTest(source=source):
+                child = self.write_session("child", source)
+                self.assertEqual(self.open_session([child, main]), main)
+
+    def test_open_session_does_not_fall_back_to_guardian(self):
+        child = self.write_session("child", {"subagent": {"other": "guardian"}})
+
+        self.assertIsNone(self.open_session([child]))
+
+    def test_open_session_prefers_recent_main_after_fork(self):
+        old = self.write_session("old", "cli")
+        current = self.write_session("current", "cli")
+        os.utime(old, (1, 1))
+        os.utime(current, (2, 2))
+
+        self.assertEqual(self.open_session([old, current]), current)
+
+    def test_open_session_preserves_legacy_metadata(self):
+        main = self.write_session("legacy", None)
+
+        self.assertEqual(self.open_session([main]), main)
+        self.assertEqual(tmux_context.session_id_from_path(main), "legacy")
+
+    def test_process_identity_rejects_inherited_subagent_thread(self):
+        child = self.write_session("child", {"subagent": {"other": "guardian"}})
+        agent_home = str(self.sessions.parent)
+        with mock.patch("tmux_context.process_environment", return_value={
+            "CODEX_HOME": agent_home, "CODEX_THREAD_ID": "child",
+        }), mock.patch("tmux_context.open_codex_session_path", return_value=None), \
+                mock.patch("tmux_context.find_session_path", return_value=child):
+            identity, detected_home = tmux_context.codex_process_identity(12345, "")
+
+        self.assertIsNone(identity)
+        self.assertEqual(detected_home, agent_home)
+
+    def test_process_identity_preserves_main_thread_fallback(self):
+        main = self.write_session("main", "cli")
+        agent_home = str(self.sessions.parent)
+        with mock.patch("tmux_context.process_environment", return_value={
+            "CODEX_HOME": agent_home, "CODEX_THREAD_ID": "main",
+        }), mock.patch("tmux_context.open_codex_session_path", return_value=None), \
+                mock.patch("tmux_context.find_session_path", return_value=main):
+            identity, detected_home = tmux_context.codex_process_identity(12345, "")
+
+        self.assertEqual(identity, ("main", agent_home, str(main)))
+        self.assertEqual(detected_home, agent_home)
+
+    def test_session_id_preserves_filename_fallback(self):
+        session_id = "01a00000-0000-7000-8000-000000000001"
+        path = self.sessions / f"rollout-{session_id}.jsonl"
+        path.write_text("incomplete metadata\n")
+
+        self.assertEqual(tmux_context.session_id_from_path(path), session_id)
+
+    def message(self, role, text, phase=""):
+        return json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": role, "phase": phase,
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }, ensure_ascii=False)
+
+    def test_transcript_skips_internal_user_messages(self):
+        lines = [self.message("user", text) for text in (
+            "# AGENTS.md instructions for /home/test\n<INSTRUCTIONS>rules</INSTRUCTIONS>",
+            "<environment_context>cwd=/home/test</environment_context>",
+            '<subagent_notification>{"agent_path":"/root/test","status":{"completed":"done"}}</subagent_notification>',
+            "The following is the Codex agent history whose request action you are assessing.",
+            "检查 tmux-context 会话识别",
+        )]
+
+        messages = tmux_context.codex_transcript_messages(lines)
+
+        self.assertEqual([message["text"] for message in messages], ["检查 tmux-context 会话识别"])
+
+    def test_question_reply_displays_answers_without_internal_metadata(self):
+        reply = "<send_user_message_question_reply>" + json.dumps([
+            {"question": "继续验证吗？", "answer": "继续验证", "questionItemId": "item-one"},
+            {"question": "需要修改配置吗？", "answer": "保持配置", "questionItemId": "item-two"},
+        ], ensure_ascii=False) + "</send_user_message_question_reply>"
+
+        messages = tmux_context.codex_transcript_messages([self.message("user", reply)])
+
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[0]["phase"], "question_reply")
+        self.assertEqual(messages[0]["text"], "继续验证吗？\n继续验证\n\n需要修改配置吗？\n保持配置")
+
+    def test_completed_title_ignores_notifications_and_question_replies(self):
+        main = self.write_session("main", "cli")
+        reply = '<send_user_message_question_reply>[{"question":"修改配置吗？","answer":"修改模型配置"}]</send_user_message_question_reply>'
+        with main.open("a") as stream:
+            for role, text, phase in (
+                ("user", "检查 tmux-context 会话识别", ""),
+                ("user", '<subagent_notification>{"status":{"completed":"done"}}</subagent_notification>', ""),
+                ("user", reply, ""),
+                ("assistant", "已完成", "final_answer"),
+            ):
+                stream.write(self.message(role, text, phase) + "\n")
+
+        self.assertEqual(tmux_context.completed_context_title(str(main)), "检查 tmux-context 会话识别")
+
+    def test_meaningful_title_rejects_cached_internal_titles(self):
+        for text in (
+            "The following is the Codex agent…",
+            '<subagent_notification> {"agent_p…',
+            "<send_user_message_question_reply…",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(meaningful_title(text), "")
+        self.assertIn("检查", meaningful_title(
+            "检查标题为什么显示 The following is the Codex agent history",
+        ))
+
+    def test_rename_replaces_cached_review_title_while_main_is_pending(self):
+        values = {
+            "#{pane_current_path}": "/home/test/project",
+            "#{@session_context_title}": "The following is the Codex agent…",
+            "#{session_name}": "The_following_is_the_Codex_agent…--cgw-project",
+            "#{@session_context_launch_name}": "cgw",
+        }
+        with mock.patch("tmux_context.resolve_source_pane", return_value="%1"), \
+                mock.patch("tmux_context.tmux_value", side_effect=lambda target, fmt: values.get(fmt, "")), \
+                mock.patch("tmux_context.project_context", return_value=("project", "", "/home/test/project")), \
+                mock.patch("tmux_context.current_context", return_value=("main", "", "/home/test/.codex", "main.jsonl")), \
+                mock.patch("tmux_context.context_title", return_value=""), \
+                mock.patch("tmux_context.unique_session_name", side_effect=lambda session, name: name), \
+                mock.patch("tmux_context.update_terminal_title") as update_title, \
+                mock.patch("tmux_context.run_tmux") as run_tmux:
+            tmux_context.rename_session("$1", "%1")
+
+        run_tmux.assert_any_call("rename-session", "-t", "$1", "cgw-project", capture=False)
+        run_tmux.assert_any_call("set-option", "-q", "-t", "$1", "@session_context_title", "", capture=False)
+        update_title.assert_called_once_with("$1", "cgw-project")
+
+
 class TmuxContextTest(unittest.TestCase):
     def test_strip_managed_block_preserves_unmanaged_content(self):
         text = "before\n# start\nmanaged\n# end\nafter\n"
