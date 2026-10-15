@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -431,6 +432,71 @@ def claude_process_identity(process_id: int) -> tuple[str, str, str] | None:
     return thread_id, str(claude_home), str(session_path)
 
 
+#add by xzhe on 20261015 start : Resolve daemon clients without guessing the newest thread.
+def daemon_rollout_paths(codex_home: str) -> list[Path]:
+    """Only accept files held by the live daemon recorded in this Codex home."""
+    try:
+        record = json.loads((Path(codex_home) / "app-server-daemon/daemon.pid").read_text())
+        pid = int(record["pid"])
+        identity = record["processIdentity"]
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if int(stat[19]) != int(identity["startTicks"]):
+            return []
+        if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != identity["bootId"]:
+            return []
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if b"app-server" not in args or Path(args[0].decode()).name != "codex":
+            return []
+        root = (Path(codex_home) / "sessions").resolve()
+        paths = set()
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                path = Path(os.readlink(fd))
+                if path.name.startswith("rollout-") and path.suffix == ".jsonl":
+                    path = path.resolve()
+                    if path.is_relative_to(root) and not is_codex_subagent_session(path):
+                        paths.add(path)
+            except OSError:
+                continue
+        return sorted(paths)
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return []
+
+
+def codex_daemon_identity(pane_id: str, codex_home: str) -> tuple[str, str, str] | None:
+    paths = daemon_rollout_paths(codex_home)
+    if not paths or len(paths) > 128:
+        return None
+    title = tmux_value(pane_id, "#{pane_title}")
+    # Codex prepends a braille activity spinner or an action-required indicator.
+    title = re.sub(r"^(?:[\u2800-\u28ff] |\[ ! \] Action Required \| )", "", title)
+    database = Path(codex_home) / "state_5.sqlite"
+    matches = []
+    try:
+        connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)
+        try:
+            deadline = time.monotonic() + 0.1
+            connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            for path in paths:
+                thread_id = session_id_from_path(path)
+                if not THREAD_ID_PATTERN.fullmatch(thread_id):
+                    continue
+                row = connection.execute(
+                    "SELECT name, cwd, rollout_path FROM threads WHERE id = ?", (thread_id,)
+                ).fetchone()
+                if not row or not row[0] or Path(row[2]).resolve() != path:
+                    continue
+                expected = f"{row[0]} | {Path(row[1]).name}"
+                if title == expected:
+                    matches.append((thread_id, codex_home, str(path)))
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return None
+    return matches[0] if len(matches) == 1 else None
+#add by xzhe on 20261015 end
+
+
 def agent_identity(pane_id: str) -> tuple[str, str, str]:
     pane_pid_text = tmux_value(pane_id, "#{pane_pid}")
     try:
@@ -450,6 +516,12 @@ def agent_identity(pane_id: str) -> tuple[str, str, str]:
             identity = claude_process_identity(process_id)
             if identity:
                 return identity
+    #add by xzhe on 20261015 start : Shared app-server is outside the pane process tree.
+    if detected_home:
+        identity = codex_daemon_identity(pane_id, detected_home)
+        if identity:
+            return identity
+    #add by xzhe on 20261015 end
     return "", detected_home, ""
 
 
@@ -1809,6 +1881,17 @@ class Sidebar:
             live_thread_id, live_title, agent_home, live_raw_path = current_context(self.source_pane)
             self.agent_active = bool(agent_home)
             self.agent_label = agent_label(live_raw_path or self.raw_path, agent_home)
+            #add by xzhe on 20261015 start : Do not retain another thread after an unresolved switch.
+            if not live_thread_id and agent_home and (Path(agent_home) / "app-server-daemon/daemon.pid").is_file():
+                self.thread_id = ""
+                self.current_title = ""
+                self.raw_path = ""
+                self.context_live = False
+                if self.all_messages:
+                    self.all_messages = []
+                    self.apply_filters()
+                return
+            #add by xzhe on 20261015 end
             if live_thread_id:
                 self.thread_id = live_thread_id
             else:

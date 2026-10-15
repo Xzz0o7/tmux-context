@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import sqlite3
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -941,6 +942,103 @@ class ClaudeTranscriptTest(unittest.TestCase):
                 path = claude_session_path(4242, {"CLAUDE_CONFIG_DIR": str(root)})
 
         self.assertEqual(Path(path).name, "current.jsonl")
+
+
+
+
+class CodexDaemonIdentityTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="tmux-context-daemon-")
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.paths = []
+        self.db = sqlite3.connect(self.home / "state_5.sqlite")
+        self.addCleanup(self.db.close)
+        self.db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT)")
+        self.title = "First | project"
+        patcher = mock.patch.object(tmux_context, "daemon_rollout_paths", side_effect=lambda home: self.paths)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(tmux_context, "tmux_value", side_effect=lambda *args: self.title)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def add_thread(self, number, name):
+        thread_id = f"00000000-0000-0000-0000-{number:012d}"
+        path = self.home / f"rollout-{thread_id}.jsonl"
+        path.write_text(json.dumps({"type": "session_meta", "payload": {"id": thread_id, "source": "cli"}}) + "\n")
+        self.db.execute("INSERT INTO threads VALUES (?, ?, ?, ?)", (thread_id, name, "/work/project", str(path)))
+        self.db.commit()
+        self.paths.append(path)
+        return thread_id
+
+    def resolve(self):
+        return tmux_context.codex_daemon_identity("%1", str(self.home))
+
+    def test_shared_daemon_selects_exact_window_and_switches(self):
+        first = self.add_thread(1, "First")
+        second = self.add_thread(2, "Second")
+        self.assertEqual(self.resolve()[0], first)
+        self.title = "Second | project"
+        self.assertEqual(self.resolve()[0], second)
+
+    def test_status_prefixes(self):
+        expected = self.add_thread(1, "First")
+        for prefix in ["", "⠧ ", "[ ! ] Action Required | "]:
+            with self.subTest(prefix=prefix):
+                self.title = prefix + "First | project"
+                self.assertEqual(self.resolve()[0], expected)
+
+    def test_ambiguous_name_fails_closed(self):
+        self.add_thread(1, "First")
+        self.add_thread(2, "First")
+        self.assertIsNone(self.resolve())
+
+    def test_unknown_or_truncated_title_fails_closed(self):
+        self.add_thread(1, "First")
+        for title in ["Fir… | project", "Other | project", "First | other"]:
+            self.title = title
+            self.assertIsNone(self.resolve())
+
+    def test_closed_thread_is_not_selected(self):
+        self.add_thread(1, "First")
+        self.paths = []
+        self.assertIsNone(self.resolve())
+
+    def test_index_path_mismatch_fails_closed(self):
+        self.add_thread(1, "First")
+        self.db.execute("UPDATE threads SET rollout_path='/other/file.jsonl'")
+        self.db.commit()
+        self.assertIsNone(self.resolve())
+
+    def test_missing_schema_is_nonfatal(self):
+        self.add_thread(1, "First")
+        self.db.execute("DROP TABLE threads")
+        self.db.commit()
+        self.assertIsNone(self.resolve())
+
+    def test_stale_daemon_record_is_nonfatal(self):
+        with mock.patch.object(tmux_context, "daemon_rollout_paths", wraps=self.original_paths):
+            self.assertIsNone(self.resolve())
+
+    def test_unresolved_switch_clears_old_sidebar(self):
+        (self.home / "app-server-daemon").mkdir()
+        (self.home / "app-server-daemon/daemon.pid").write_text("{}")
+        sidebar = tmux_context.Sidebar.__new__(tmux_context.Sidebar)
+        sidebar.raw_path = "/old/rollout.jsonl"
+        sidebar.source_pane = "%1"
+        sidebar.thread_id = "old-thread"
+        sidebar.current_title = "old-title"
+        sidebar.all_messages = [{"role": "user", "text": "old"}]
+        sidebar.apply_filters = mock.Mock()
+        with mock.patch.object(tmux_context, "current_context", return_value=("", "", str(self.home), "")):
+            sidebar.reload(force=True)
+        self.assertEqual(sidebar.raw_path, "")
+        self.assertEqual(sidebar.thread_id, "")
+        self.assertEqual(sidebar.all_messages, [])
+        sidebar.apply_filters.assert_called_once()
+
+    original_paths = staticmethod(tmux_context.daemon_rollout_paths)
 
 
 if __name__ == "__main__":
