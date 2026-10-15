@@ -17,6 +17,7 @@
 | 环境 | 支持程度 | 说明 |
 |---|---|---|
 | Linux 终端 | 完整支持 | 需要 Python 3.10+ 与 tmux 3.2+ |
+| macOS 终端 | 支持 Codex | Python 3.10+、tmux 3.2+；验证范围见 ROADMAP |
 | Windows Terminal + WSL2 | 完整支持 | 推荐的 Windows 配置 |
 | Windows PowerShell | 桥接支持 | PowerShell 在 WSL2 内调用同一套运行时 |
 | 未安装 WSL 的原生 PowerShell | 不支持 | tmux、`/proc` 与 curses 需要 POSIX 主机 |
@@ -27,12 +28,14 @@ PowerShell 兼容表示可以从 PowerShell 安装、启动、诊断和连接会
 
 | CLI | 会话记录 | 识别方式 |
 |---|---|---|
-| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | pane 进程打开的文件描述符，或 `CODEX_THREAD_ID` |
+| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | pane 文件描述符、`CODEX_THREAD_ID`，或经过校验的 daemon 与标题匹配 |
 | Claude Code | `$CLAUDE_CONFIG_DIR/projects/<cwd 目录名>/<session-id>.jsonl` | pane 进程的工作目录，配合最接近的会话起始时间 |
 
 Claude Code 每次写入后都会关闭会话文件，因此改用记录中的 `cwd` 与进程启动时间来匹配；同一目录下同时运行的多个 Claude 会话也能各自对应到自己的侧边栏。
 
 Codex 识别会排除 `session_meta.source` 中标记为子会话的记录，包括 guardian 审批审查。同一进程在 fork 后仍打开多个主会话记录时，选择最近更新的主会话。
+
+使用 daemon 的 Codex 会话通过已校验的 daemon 进程、其打开的主会话文件，以及原生 pane 标题与只读会话索引的精确匹配来绑定。未命名、同名、截断或被手动覆盖的标题可能无法识别；无法确认会话切换时会清除侧栏旧对话。macOS 通过系统 API 校验进程启动时间和本次系统启动的 UUID，不修改 Codex 配置或数据库。
 
 ## 功能
 
@@ -49,6 +52,34 @@ Codex 识别会排除 `session_meta.source` 中标记为子会话的记录，包
 - 受管理的 `codex resume` 若命中已有 live writer，会直接回到原 tmux 会话，不再为同一 thread 启动第二个 writer。
 - 受管理会话在启动命令退出或最后一个 tmux client 离开时自动关闭，不遗留侧边栏或登录 shell。
 - `Ctrl-b H` 切换侧边栏，`Ctrl-b R` 刷新当前会话名称。
+
+## 在 macOS 安装
+
+```bash
+brew install python tmux git
+git clone https://github.com/Xzz0o7/tmux-context.git ~/tmux-context
+cd ~/tmux-context
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+tmux-context doctor
+tmux-context run --name codex -- codex
+```
+
+从 tmux 外的普通终端启动。安装器创建 `~/.local/bin/tmux-context`，并在
+`~/.tmux-context/tmux/bin/tmux-context` 固定已验证的 Python 和 tmux 路径。
+请保留仓库；移动仓库或删除所用 Python 后需要重新安装。若 shell 的 PATH
+没有 `~/.local/bin`，请加入该目录。安装器不会覆盖已有的非本工具命令。
+
+macOS 使用系统 `ps`、`sysctl` 和 `lsof` 识别进程，通过打开的主会话 transcript
+或明确的 thread 环境绑定 Codex 会话；排除子会话后，多个主会话按修改时间
+选择最近更新的一份，与 Linux/WSL 行为一致。
+`doctor` 会检查进程访问能力，Windows Terminal 检查在 macOS 显示 `SKIP`。
+macOS 的进程识别支持范围为 Codex。
+
+中文复制通过 UTF-8 `pbcopy`，失败时回退到 tmux buffer。标题通过客户端 TTY
+同步，退出时发送 OSC 恢复序列；实际外观取决于终端标题设置。
+安装保留已有状态栏主题，配置备份位于 `~/.tmux-context/tmux/backups`。
+下文描述的受管理会话退出和最后客户端 detach 清理规则同样适用。
 
 ## 从 WSL 或 Linux 安装
 

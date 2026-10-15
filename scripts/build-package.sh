@@ -15,9 +15,9 @@ archive="$repo_dir/dist/tmux-context-$version.zip"
 (
     cd "$repo_dir"
     zip -qr "$archive" \
-        AGENTS.md README.md VERSION LICENSE-REQUIRED.md \
-        tmux-context tmux-context.ps1 install.sh Install-TmuxContext.ps1 tmux_context.py \
-        scripts tests \
+        AGENTS.md README.md README.zh-CN.md ROADMAP.md VERSION LICENSE-REQUIRED.md \
+        tmux-context tmux-context.ps1 install.sh Install-TmuxContext.ps1 tmux_context.py macos_process.py \
+        docs scripts tests \
         -x '*/__pycache__/*' '*.py[cod]' 'dist/*'
 )
 printf '%s\n' "$archive"

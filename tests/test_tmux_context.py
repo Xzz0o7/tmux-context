@@ -71,7 +71,8 @@ class CodexSessionIdentityTest(unittest.TestCase):
     def open_session(self, paths):
         entries = [Path(f"/proc/12345/fd/{index}") for index in range(len(paths))]
         targets = dict(zip(entries, map(str, paths)))
-        with mock.patch.object(Path, "iterdir", return_value=entries), \
+        with mock.patch("tmux_context.sys.platform", "linux"), \
+                mock.patch.object(Path, "iterdir", return_value=entries), \
                 mock.patch("tmux_context.os.readlink", side_effect=targets.__getitem__):
             return tmux_context.open_codex_session_path(12345)
 
@@ -319,7 +320,7 @@ class TmuxContextTest(unittest.TestCase):
         self.assertIn("recover-active-writer", runner_command)
         self.assertIn('"$TMUX_PANE"', command)
         self.assertIn("close-agent-exit", command)
-        self.assertIn('exit "$status"', command)
+        self.assertIn('exit "$tmux_context_exit"', command)
         self.assertNotIn("exec /bin/bash -l", command)
 
     def test_tmux_launch_command_closes_instead_of_starting_login_shell(self):
@@ -924,7 +925,7 @@ class ClaudeTranscriptTest(unittest.TestCase):
         started = 1785000000.0
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            cwd = str(root / "repo")
+            cwd = str((root / "repo").resolve())
             projects = root / "projects" / claude_project_slug(cwd)
             for name, offset in (("old.jsonl", -7200), ("current.jsonl", 12)):
                 stamp = datetime.fromtimestamp(started + offset).astimezone().isoformat()
@@ -950,7 +951,7 @@ class CodexDaemonIdentityTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="tmux-context-daemon-")
         self.addCleanup(temporary.cleanup)
-        self.home = Path(temporary.name)
+        self.home = Path(temporary.name).resolve()
         self.paths = []
         self.db = sqlite3.connect(self.home / "state_5.sqlite")
         self.addCleanup(self.db.close)

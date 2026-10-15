@@ -17,6 +17,7 @@ This is a deliberately fictional demonstration. The tab strip shows different ta
 | Environment | Support | Notes |
 |---|---|---|
 | Linux terminal | Full | Requires Python 3.10+ and tmux 3.2+ |
+| macOS terminal | Codex support | Python 3.10+, tmux 3.2+; validation details in ROADMAP.md |
 | Windows Terminal + WSL2 | Full | Recommended Windows configuration |
 | Windows PowerShell | Bridge | PowerShell invokes the same runtime inside WSL2 |
 | Native PowerShell without WSL | Unsupported | tmux, `/proc`, and curses require a POSIX host |
@@ -27,12 +28,19 @@ PowerShell compatibility means that you can install, launch, diagnose, and attac
 
 | CLI | Transcript | Detection |
 |---|---|---|
-| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | Open file descriptor of the pane process, or `CODEX_THREAD_ID` |
+| Codex | `$CODEX_HOME/sessions/rollout-*.jsonl` | Pane file descriptors, `CODEX_THREAD_ID`, or verified daemon/title matching |
 | Claude Code | `$CLAUDE_CONFIG_DIR/projects/<cwd slug>/<session-id>.jsonl` | Pane process working directory, matched to the transcript that started with it |
 
 Claude Code closes its transcript between writes, so the session is matched by the recorded `cwd` and the closest transcript start time. Concurrent Claude sessions in the same directory therefore stay on their own sidebar.
 
 Codex detection excludes transcripts marked as subagents in `session_meta.source`, including guardian approval reviews. If a process keeps multiple main transcripts open after a fork, the most recently updated main transcript is selected.
+
+Daemon-backed Codex sessions are associated using a verified daemon process,
+its open main transcripts, and an exact match between the native pane title and
+the read-only session index. Unnamed, duplicate, truncated, or manually replaced
+titles can remain unidentified; an unresolved switch clears the previous sidebar
+conversation. On macOS, daemon verification checks the kernel process birth time
+and boot UUID through system APIs. Codex configuration and databases are not modified.
 
 ## Features
 
@@ -49,6 +57,37 @@ Codex detection excludes transcripts marked as subagents in `session_meta.source
 - Managed `codex resume` launches reconnect to an existing live tmux writer instead of starting a second writer for the same thread.
 - Managed sessions close when their launch command exits or their last tmux client leaves, without leaving a sidebar or login shell behind.
 - `Ctrl-b H` toggles the sidebar; `Ctrl-b R` refreshes the current session name.
+
+## Install on macOS
+
+```bash
+brew install python tmux git
+git clone https://github.com/Xzz0o7/tmux-context.git ~/tmux-context
+cd ~/tmux-context
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+tmux-context doctor
+tmux-context run --name codex -- codex
+```
+
+Run the launcher from a regular terminal, outside tmux. The installer creates
+`~/.local/bin/tmux-context` and pins the validated Python interpreter and tmux
+directory in `~/.tmux-context/tmux/bin/tmux-context`. Keep the checkout in place;
+reinstall after moving it or removing that Python installation. Add
+`~/.local/bin` to your shell PATH if it is not already present.
+
+Darwin process discovery uses `ps`, `sysctl`, and `lsof`, without Python packages.
+Codex identity comes from an open main transcript or its explicit thread environment;
+subagent transcripts are excluded, and multiple main transcripts use the latest
+modification time, matching Linux/WSL behavior.
+Restricted process access is reported by `doctor`. macOS supports Codex process
+discovery; Windows Terminal checks are skipped.
+
+Copying uses UTF-8 `pbcopy`, falling back to the tmux buffer. Terminal titles use
+the client TTY and OSC save/restore sequences; the terminal's title settings may
+affect their appearance. Existing status-left/status-right theme settings are
+preserved. Configuration backups are stored under `~/.tmux-context/tmux/backups`.
+The managed-session detach/exit behavior described below also applies on macOS.
 
 ## Install from WSL or Linux
 

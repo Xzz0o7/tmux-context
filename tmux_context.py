@@ -20,9 +20,12 @@ import threading
 import time
 import unicodedata
 
+if sys.platform == "darwin":
+    import macos_process
+
 
 REPO_ROOT = Path(__file__).resolve().parent
-ENTRYPOINT = REPO_ROOT / "tmux-context"
+ENTRYPOINT = Path(os.environ.get("TMUX_CONTEXT_ENTRYPOINT", str(REPO_ROOT / "tmux-context")))
 APP_DIR = Path.home() / ".tmux-context"
 INDEX_PATH = APP_DIR / "index.jsonl"
 TMUX_RUNTIME_DIR = APP_DIR / "tmux"
@@ -170,6 +173,8 @@ def project_context(cwd: str) -> tuple[str, str, str]:
 
 
 def process_descendants(root_pid: int) -> list[int]:
+    if sys.platform == "darwin":
+        return macos_process.descendants(root_pid)
     result = []
     queue = [root_pid]
     visited = set()
@@ -189,6 +194,8 @@ def process_descendants(root_pid: int) -> list[int]:
 
 
 def process_environment(process_id: int) -> dict[str, str]:
+    if sys.platform == "darwin":
+        return macos_process.procargs(process_id)[1]
     try:
         data = Path(f"/proc/{process_id}/environ").read_bytes()
     except OSError:
@@ -203,6 +210,8 @@ def process_environment(process_id: int) -> dict[str, str]:
 
 
 def process_command(process_id: int) -> str:
+    if sys.platform == "darwin":
+        return shlex.join(macos_process.procargs(process_id)[0])
     try:
         return Path(f"/proc/{process_id}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore")
     except OSError:
@@ -255,6 +264,12 @@ def is_codex_subagent_session(session_path: Path) -> bool:
 
 
 def open_codex_session_path(process_id: int) -> Path | None:
+    if sys.platform == "darwin":
+        candidates = [Path(path) for path in macos_process.open_paths(process_id)
+                      if Path(path).suffix == ".jsonl" and "sessions" in Path(path).parts
+                      and Path(path).name.startswith("rollout-")
+                      and not is_codex_subagent_session(Path(path))]
+        return max(candidates, key=file_mtime, default=None)
     fd_dir = Path(f"/proc/{process_id}/fd")
     try:
         entries = list(fd_dir.iterdir())
@@ -419,7 +434,7 @@ def codex_process_identity(process_id: int, detected_home: str) -> tuple[tuple[s
             return None, detected_home
         # add by xzhe on 20260930 end
         return (thread_id, codex_home, str(session_path or "")), detected_home
-    return None, detected_home
+    return None, detected_home or str(Path.home() / ".codex")
 
 
 def claude_process_identity(process_id: int) -> tuple[str, str, str] | None:
@@ -439,19 +454,26 @@ def daemon_rollout_paths(codex_home: str) -> list[Path]:
         record = json.loads((Path(codex_home) / "app-server-daemon/daemon.pid").read_text())
         pid = int(record["pid"])
         identity = record["processIdentity"]
-        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        if int(stat[19]) != int(identity["startTicks"]):
-            return []
-        if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != identity["bootId"]:
-            return []
-        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        if b"app-server" not in args or Path(args[0].decode()).name != "codex":
+        if sys.platform == "darwin":
+            if not macos_process.matches_identity(pid, identity):
+                return []
+            args = [os.fsencode(arg) for arg in macos_process.procargs(pid)[0]]
+        else:
+            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            if int(stat[19]) != int(identity["startTicks"]):
+                return []
+            if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != identity["bootId"]:
+                return []
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if not args or b"app-server" not in args or Path(os.fsdecode(args[0])).name != "codex":
             return []
         root = (Path(codex_home) / "sessions").resolve()
         paths = set()
-        for fd in Path(f"/proc/{pid}/fd").iterdir():
+        entries = (macos_process.open_paths(pid) if sys.platform == "darwin"
+                   else Path(f"/proc/{pid}/fd").iterdir())
+        for entry in entries:
             try:
-                path = Path(os.readlink(fd))
+                path = Path(entry) if sys.platform == "darwin" else Path(os.readlink(entry))
                 if path.name.startswith("rollout-") and path.suffix == ".jsonl":
                     path = path.resolve()
                     if path.is_relative_to(root) and not is_codex_subagent_session(path):
@@ -876,7 +898,7 @@ def update_terminal_title(session_id: str, title: str) -> None:
         client_session_id, client_pid, client_tty = fields
         if client_session_id != session_id:
             continue
-        targets = [(f"/proc/{client_pid}/fd/1", "proc")]
+        targets = [] if sys.platform == "darwin" else [(f"/proc/{client_pid}/fd/1", "proc")]
         if client_tty.startswith("/dev/"):
             targets.append((client_tty, "tty"))
         for target, method in targets:
@@ -1736,6 +1758,8 @@ def copy_text_to_clipboard(text: str) -> str:
                 if result.returncode == 0:
                     return "Windows clipboard"
     commands = []
+    if sys.platform == "darwin":
+        commands.append((["/usr/bin/pbcopy"], "macOS clipboard"))
     windows_clipboard = Path("/mnt/c/Windows/System32/clip.exe")
     if os.environ.get("WSL_DISTRO_NAME") and windows_clipboard.is_file():
         commands.append(([str(windows_clipboard)], "Windows clipboard"))
@@ -1747,13 +1771,13 @@ def copy_text_to_clipboard(text: str) -> str:
         try:
             result = subprocess.run(
                 command,
-                input=text,
-                text=True,
+                input=text.encode("utf-8"),
+                timeout=3,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             continue
         if result.returncode == 0:
             return destination
@@ -2323,9 +2347,6 @@ bind-key -T copy-mode-vi MouseDragEnd1Pane if-shell -F '#{{@session_context_side
 set -g set-titles on
 set -g set-titles-string '#{{?#{{m:? *,#{{pane_title}}}},#{{s/ .*//:pane_title}} ,}}#S'
 set -g status-interval 5
-set -g status-left-length 90
-set -g status-left '#[bold]#S#[default] '
-set -g status-right '#[fg=colour244]%Y-%m-%d %H:%M'
 
 set-hook -g after-new-session 'run-shell -b "{command} setup #{{q:session_id}} #{{q:pane_id}}"'
 set-hook -g client-attached 'run-shell -b "{command} setup #{{q:session_id}} #{{q:pane_id}}"'
@@ -2386,9 +2407,42 @@ def mark_existing_managed_sessions() -> int:
 #add by xzhe on 20260821 end
 
 
+def install_runtime() -> Path:
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Python 3.10+ is required; install Homebrew Python and retry.")
+    tmux = shutil.which("tmux")
+    if not tmux:
+        raise RuntimeError("tmux 3.2+ is required.")
+    version = subprocess.run([tmux, "-V"], capture_output=True, text=True, timeout=3)
+    match = re.search(r"tmux (\d+)\.(\d+)", version.stdout)
+    if not match or tuple(map(int, match.groups())) < (3, 2):
+        raise RuntimeError("tmux 3.2+ is required.")
+    entry = TMUX_RUNTIME_DIR / "bin" / "tmux-context"
+    public = USER_TMUX_CONFIG_PATH.parent / ".local" / "bin" / "tmux-context"
+    if os.path.lexists(public) and (not public.is_symlink() or public.resolve() != entry.resolve()):
+        raise RuntimeError(f"Existing command is not managed by tmux-context: {public}")
+    script = ("#!/bin/sh\n# Managed by tmux-context install\n"
+              f"export TMUX_CONTEXT_ENTRYPOINT={shlex.quote(str(entry))}\n"
+              f"export PATH={shlex.quote(str(Path(tmux).parent))}:\"$PATH\"\n"
+              f"exec {shlex.quote(sys.executable)} {shlex.quote(str(REPO_ROOT / 'tmux_context.py'))} \"$@\"\n")
+    write_text_atomic(entry, script)
+    entry.chmod(0o755)
+    public.parent.mkdir(parents=True, exist_ok=True)
+    if not os.path.lexists(public):
+        public.symlink_to(entry)
+    return entry
+
+
 def install_tmux_integration() -> int:
+    try:
+        entry = install_runtime()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(str(error), file=sys.stderr)
+        return 1
     TMUX_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(TMUX_CONFIG_PATH, generated_tmux_config())
+    if TMUX_CONFIG_PATH.exists():
+        backup_file(TMUX_CONFIG_PATH, "generated-config")
+    write_text_atomic(TMUX_CONFIG_PATH, generated_tmux_config(entry))
 
     current = USER_TMUX_CONFIG_PATH.read_text() if USER_TMUX_CONFIG_PATH.exists() else ""
     updated = strip_managed_block(current, CS_MANAGER_BLOCK_START, CS_MANAGER_BLOCK_END)
@@ -2401,7 +2455,7 @@ def install_tmux_integration() -> int:
         backup_path = backup_file(USER_TMUX_CONFIG_PATH, "tmux.conf")
         write_text_atomic(USER_TMUX_CONFIG_PATH, updated)
 
-    source_result = run_tmux("source-file", str(TMUX_CONFIG_PATH))
+    source_result = run_tmux("source-file", str(USER_TMUX_CONFIG_PATH))
     marked_sessions = mark_existing_managed_sessions() if source_result.returncode == 0 else 0
     print(f"Installed tmux integration: {TMUX_CONFIG_PATH}")
     print(f"Managed tmux entry: {USER_TMUX_CONFIG_PATH}")
@@ -2423,6 +2477,12 @@ def uninstall_tmux_integration() -> int:
         write_text_atomic(USER_TMUX_CONFIG_PATH, updated)
     if TMUX_CONFIG_PATH.exists():
         TMUX_CONFIG_PATH.unlink()
+    entry = TMUX_RUNTIME_DIR / "bin" / "tmux-context"
+    public = USER_TMUX_CONFIG_PATH.parent / ".local" / "bin" / "tmux-context"
+    if public.is_symlink() and public.resolve() == entry.resolve():
+        public.unlink()
+    if entry.is_file() and "# Managed by tmux-context install" in entry.read_text():
+        entry.unlink()
     print("Removed tmux-context integration.")
     if backup_path:
         print(f"Backup: {backup_path}")
@@ -2562,6 +2622,8 @@ def attach_with_terminal_title(session_id: str) -> int:
         return subprocess.call(["tmux", "attach-session", "-t", session_id])
 
     stop_event = threading.Event()
+    if sys.platform == "darwin":
+        os.write(terminal_fd, b"\033[22;0t")
     watcher = threading.Thread(
         target=watch_terminal_title,
         args=(terminal_tty, terminal_fd, stop_event),
@@ -2574,7 +2636,9 @@ def attach_with_terminal_title(session_id: str) -> int:
         stop_event.set()
         watcher.join(timeout=3)
         try:
-            os.write(terminal_fd, terminal_title_sequence(os.environ.get("WSL_DISTRO_NAME", "WSL")))
+            restore = (b"\033[23;0t" if sys.platform == "darwin" else
+                       terminal_title_sequence(os.environ.get("WSL_DISTRO_NAME", "WSL")))
+            os.write(terminal_fd, restore)
         except OSError:
             pass
         os.close(terminal_fd)
@@ -2704,13 +2768,13 @@ def tmux_launch_command(command: list[str]) -> str:
     cleanup = shlex.quote(f"{ENTRYPOINT} close-agent-exit #{{q:session_id}}")
     close_session = f'tmux run-shell -b -t "$TMUX_PANE" {cleanup}'
     if not is_codex_resume_command(command):
-        return f'{mark_managed}; {launch}; status=$?; {close_session}; exit "$status"'
+        return f'{mark_managed}; {launch}; tmux_context_exit=$?; {close_session}; exit "$tmux_context_exit"'
     recovery = shlex.quote(str(ENTRYPOINT))
     return (
         f"{mark_managed}; export TMUX_CONTEXT_RESUME_LAUNCHER=1; "
-        f"{launch}; status=$?; "
-        f'if [ "$status" -ne 0 ] && {recovery} recover-active-writer --pane "$TMUX_PANE"; '
-        f'then status=0; fi; {close_session}; exit "$status"'
+        f"{launch}; tmux_context_exit=$?; "
+        f'if [ "$tmux_context_exit" -ne 0 ] && {recovery} recover-active-writer --pane "$TMUX_PANE"; '
+        f'then tmux_context_exit=0; fi; {close_session}; exit "$tmux_context_exit"'
     )
 #add by xzhe on 20260821 end
 
@@ -2799,11 +2863,22 @@ def doctor_tmux_integration() -> int:
         ("tmux-context entrypoint", ENTRYPOINT.is_file() and os.access(ENTRYPOINT, os.X_OK)),
         ("generated config", TMUX_CONFIG_PATH.is_file()),
         ("managed source", MANAGED_BLOCK_START in (USER_TMUX_CONFIG_PATH.read_text() if USER_TMUX_CONFIG_PATH.exists() else "")),
-        ("Windows Terminal settings", windows_terminal_settings_path() is not None),
+        ("Python >= 3.10", sys.version_info >= (3, 10)),
     ]
+    if sys.platform == "darwin":
+        checks.extend([
+            ("macOS process arguments", bool(macos_process.procargs(os.getpid())[0])),
+            ("macOS process table", bool(macos_process.query('/bin/ps', '-p', str(os.getpid()), '-o', 'pid='))),
+            ("lsof", os.access('/usr/sbin/lsof', os.X_OK)),
+            ("macOS clipboard", os.access('/usr/bin/pbcopy', os.X_OK)),
+        ])
     for label, passed in checks:
         print(f"[{'OK' if passed else 'FAIL'}] {label}")
-    return 0 if all(passed for _, passed in checks[:4]) else 1
+    if sys.platform == "darwin":
+        print("[SKIP] Windows Terminal settings (macOS)")
+    else:
+        print(f"[{'OK' if windows_terminal_settings_path() else 'WARN'}] Windows Terminal settings")
+    return 0 if all(passed for _, passed in checks) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
